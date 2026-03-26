@@ -69,6 +69,19 @@ if(CUDA_ENABLED)
     target_link_libraries(colmap_estimators PUBLIC colmap_util_cuda)
 endif()
 
+if(BAE_ENABLED)
+    target_sources(colmap_estimators
+        PRIVATE
+            bundle_adjustment_bae.h
+            bundle_adjustment_bae.cc
+    )
+    target_link_libraries(colmap_estimators
+        PUBLIC
+            pybind11::embed
+            Python3::Python
+    )
+endif()
+
 COLMAP_ADD_TEST(
     NAME alignment_test
     SRCS alignment_test.cc

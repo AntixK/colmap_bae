@@ -29,7 +29,9 @@
 
 #include "colmap/estimators/bundle_adjustment.h"
 
+#ifdef COLMAP_BAE_ENABLED
 #include "colmap/estimators/bundle_adjustment_bae.h"
+#endif
 #include "colmap/estimators/bundle_adjustment_ceres.h"
 
 namespace colmap {
@@ -277,18 +279,22 @@ const BundleAdjustmentConfig& BundleAdjuster::Config() const { return config_; }
 ////////////////////////////////////////////////////////////////////////////////
 
 BundleAdjustmentBackendOptions::BundleAdjustmentBackendOptions()
-    : ceres(std::make_shared<CeresBundleAdjustmentOptions>()),
-      bae(std::make_shared<BaeBundleAdjustmentOptions>()) {}
+    : ceres(std::make_shared<CeresBundleAdjustmentOptions>())
+#ifdef COLMAP_BAE_ENABLED
+      , bae(std::make_shared<BaeBundleAdjustmentOptions>())
+#endif
+{}
 
 BundleAdjustmentBackendOptions::BundleAdjustmentBackendOptions(
     const BundleAdjustmentBackendOptions& other) {
   if (other.ceres) {
     ceres = std::make_shared<CeresBundleAdjustmentOptions>(*other.ceres);
   }
-  // Copy BAE option if backend if BAE.
+#ifdef COLMAP_BAE_ENABLED
   if (other.bae) {
     bae = std::make_shared<BaeBundleAdjustmentOptions>(*other.bae);
   }
+#endif
 }
 
 BundleAdjustmentBackendOptions& BundleAdjustmentBackendOptions::operator=(
@@ -301,11 +307,13 @@ BundleAdjustmentBackendOptions& BundleAdjustmentBackendOptions::operator=(
   } else {
     ceres.reset();
   }
+#ifdef COLMAP_BAE_ENABLED
   if (other.bae) {
     bae = std::make_shared<BaeBundleAdjustmentOptions>(*other.bae);
   } else {
     bae.reset();
   }
+#endif
   return *this;
 }
 
@@ -314,7 +322,13 @@ bool BundleAdjustmentOptions::Check() const {
     case BundleAdjustmentBackend::CERES:
       return THROW_CHECK_NOTNULL(ceres)->Check();
     case BundleAdjustmentBackend::BAE:
+#ifdef COLMAP_BAE_ENABLED
       return THROW_CHECK_NOTNULL(bae)->Check();
+#else
+      LOG(FATAL_THROW) << "BAE backend requested but COLMAP was built "
+                          "without BAE support (BAE_ENABLED=OFF)";
+      return false;
+#endif
   }
   LOG(FATAL_THROW) << "Unknown bundle adjustment backend: "
                    << static_cast<int>(backend);
@@ -329,7 +343,13 @@ std::unique_ptr<BundleAdjuster> CreateDefaultBundleAdjuster(
     case BundleAdjustmentBackend::CERES:
       return CreateDefaultCeresBundleAdjuster(options, config, reconstruction);
     case BundleAdjustmentBackend::BAE:
+#ifdef COLMAP_BAE_ENABLED
       return CreateDefaultBaeBundleAdjuster(options, config, reconstruction);
+#else
+      LOG(FATAL_THROW) << "BAE backend requested but COLMAP was built "
+                          "without BAE support (BAE_ENABLED=OFF)";
+      return nullptr;
+#endif
   }
   LOG(FATAL_THROW) << "Unknown bundle adjustment backend: "
                    << static_cast<int>(options.backend);

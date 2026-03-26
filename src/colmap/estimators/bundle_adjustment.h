@@ -43,6 +43,7 @@ namespace colmap {
 
 struct CeresBundleAdjustmentOptions;
 struct CeresPosePriorBundleAdjustmentOptions;
+struct BaeBundleAdjustmentOptions;
 
 MAKE_ENUM_CLASS_OVERLOAD_STREAM(
     BundleAdjustmentGauge, -1, UNSPECIFIED, TWO_CAMS_FROM_WORLD, THREE_POINTS);
@@ -57,7 +58,9 @@ MAKE_ENUM_CLASS_OVERLOAD_STREAM(BundleAdjustmentTerminationType,
                                 USER_FAILURE);
 
 // Backend for bundle adjustment solver.
-MAKE_ENUM_CLASS_OVERLOAD_STREAM(BundleAdjustmentBackend, 0, CERES);
+// Added BAE in addition to Ceres solver
+
+MAKE_ENUM_CLASS_OVERLOAD_STREAM(BundleAdjustmentBackend, 0, CERES, BAE);
 
 // Summary of bundle adjustment results, independent of solver backend.
 struct BundleAdjustmentSummary {
@@ -153,6 +156,9 @@ class BundleAdjustmentConfig {
 struct BundleAdjustmentBackendOptions {
   // Ceres-specific options (only used when backend == CERES).
   std::shared_ptr<CeresBundleAdjustmentOptions> ceres;
+
+  // BAE-specific options (only used when backend == BAE).
+  std::shared_ptr<BaeBundleAdjustmentOptions> bae;
 
   BundleAdjustmentBackendOptions();
   BundleAdjustmentBackendOptions(const BundleAdjustmentBackendOptions& other);

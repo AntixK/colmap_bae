@@ -29,6 +29,7 @@
 
 #include "colmap/estimators/bundle_adjustment.h"
 
+#include "colmap/estimators/bundle_adjustment_bae.h"
 #include "colmap/estimators/bundle_adjustment_ceres.h"
 
 namespace colmap {
@@ -276,12 +277,17 @@ const BundleAdjustmentConfig& BundleAdjuster::Config() const { return config_; }
 ////////////////////////////////////////////////////////////////////////////////
 
 BundleAdjustmentBackendOptions::BundleAdjustmentBackendOptions()
-    : ceres(std::make_shared<CeresBundleAdjustmentOptions>()) {}
+    : ceres(std::make_shared<CeresBundleAdjustmentOptions>()),
+      bae(std::make_shared<BaeBundleAdjustmentOptions>()) {}
 
 BundleAdjustmentBackendOptions::BundleAdjustmentBackendOptions(
     const BundleAdjustmentBackendOptions& other) {
   if (other.ceres) {
     ceres = std::make_shared<CeresBundleAdjustmentOptions>(*other.ceres);
+  }
+  // Copy BAE option if backend if BAE.
+  if (other.bae) {
+    bae = std::make_shared<BaeBundleAdjustmentOptions>(*other.bae);
   }
 }
 
@@ -295,11 +301,24 @@ BundleAdjustmentBackendOptions& BundleAdjustmentBackendOptions::operator=(
   } else {
     ceres.reset();
   }
+  if (other.bae) {
+    bae = std::make_shared<BaeBundleAdjustmentOptions>(*other.bae);
+  } else {
+    bae.reset();
+  }
   return *this;
 }
 
 bool BundleAdjustmentOptions::Check() const {
-  return THROW_CHECK_NOTNULL(ceres)->Check();
+  switch (backend) {
+    case BundleAdjustmentBackend::CERES:
+      return THROW_CHECK_NOTNULL(ceres)->Check();
+    case BundleAdjustmentBackend::BAE:
+      return THROW_CHECK_NOTNULL(bae)->Check();
+  }
+  LOG(FATAL_THROW) << "Unknown bundle adjustment backend: "
+                   << static_cast<int>(backend);
+  return false;
 }
 
 std::unique_ptr<BundleAdjuster> CreateDefaultBundleAdjuster(
@@ -309,6 +328,8 @@ std::unique_ptr<BundleAdjuster> CreateDefaultBundleAdjuster(
   switch (options.backend) {
     case BundleAdjustmentBackend::CERES:
       return CreateDefaultCeresBundleAdjuster(options, config, reconstruction);
+    case BundleAdjustmentBackend::BAE:
+      return CreateDefaultBaeBundleAdjuster(options, config, reconstruction);
   }
   LOG(FATAL_THROW) << "Unknown bundle adjustment backend: "
                    << static_cast<int>(options.backend);
@@ -365,6 +386,10 @@ std::unique_ptr<BundleAdjuster> CreatePosePriorBundleAdjuster(
                                                 config,
                                                 std::move(pose_priors),
                                                 reconstruction);
+    case BundleAdjustmentBackend::BAE:
+      LOG(FATAL_THROW)
+          << "PosePrior bundle adjustment is not supported with BAE backend";
+      return nullptr;
   }
   LOG(FATAL_THROW) << "Unknown bundle adjustment backend: "
                    << static_cast<int>(options.backend);

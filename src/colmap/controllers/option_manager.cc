@@ -773,6 +773,12 @@ void OptionManager::AddGlobalMapperOptions() {
                    &global_mapper->mapper.bundle_adjustment.refine_points3D);
   AddDefaultOption("GlobalMapper.ba_min_track_length",
                    &global_mapper->mapper.bundle_adjustment.min_track_length);
+
+  AddDefaultEnumOption("GlobalMapper.ba_backend",
+                       &global_mapper->mapper.bundle_adjustment.backend,
+                       BundleAdjustmentBackendToString,
+                       BundleAdjustmentBackendFromString);
+
   // Bundle adjustment options (Ceres-specific).
   AddDefaultOption("GlobalMapper.ba_ceres_use_gpu",
                    &global_mapper->mapper.bundle_adjustment.ceres->use_gpu);
@@ -784,6 +790,18 @@ void OptionManager::AddGlobalMapperOptions() {
   AddDefaultOption("GlobalMapper.ba_ceres_max_num_iterations",
                    &global_mapper->mapper.bundle_adjustment.ceres
                         ->solver_options.max_num_iterations);
+
+#ifdef COLMAP_BAE_ENABLED
+  // Bundle adjustment options (BAE-specific).
+  AddDefaultOption(
+      "GlobalMapper.ba_bae_max_num_iterations",
+      &global_mapper->mapper.bundle_adjustment.bae->max_num_iterations);
+  AddDefaultOption("GlobalMapper.ba_bae_use_gpu",
+                   &global_mapper->mapper.bundle_adjustment.bae->use_gpu);
+  AddDefaultOption("GlobalMapper.ba_bae_gpu_index",
+                   &global_mapper->mapper.bundle_adjustment.bae->gpu_index);
+#endif
+
   AddDefaultOption("GlobalMapper.ba_skip_fixed_rotation_stage",
                    &global_mapper->mapper.ba_skip_fixed_rotation_stage);
   AddDefaultOption("GlobalMapper.ba_skip_joint_optimization_stage",

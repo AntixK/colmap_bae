@@ -34,6 +34,9 @@
 #include "colmap/controllers/incremental_pipeline.h"
 #include "colmap/controllers/pairing.h"
 #include "colmap/estimators/bundle_adjustment_ceres.h"
+#ifdef COLMAP_BAE_ENABLED
+#include "colmap/estimators/bundle_adjustment_bae.h"
+#endif
 #include "colmap/estimators/global_positioning.h"
 #include "colmap/estimators/gravity_refinement.h"
 #include "colmap/estimators/two_view_geometry.h"
@@ -508,6 +511,11 @@ void OptionManager::AddBundleAdjustmentOptions() {
   AddDefaultOption("BundleAdjustment.min_track_length",
                    &bundle_adjustment->min_track_length);
 
+  AddDefaultEnumOption("BundleAdjustment.backend",
+                       &bundle_adjustment->backend,
+                       BundleAdjustmentBackendToString,
+                       BundleAdjustmentBackendFromString);
+
   // Ceres-specific options
   AddDefaultOption(
       "BundleAdjustmentCeres.max_num_iterations",
@@ -545,6 +553,16 @@ void OptionManager::AddBundleAdjustmentOptions() {
   AddDefaultOption(
       "BundleAdjustmentCeres.max_num_images_direct_sparse_gpu_solver",
       &bundle_adjustment->ceres->max_num_images_direct_sparse_gpu_solver);
+
+#ifdef COLMAP_BAE_ENABLED
+  // BAE-specific options
+  AddDefaultOption("BundleAdjustmentBae.max_num_iterations",
+                   &bundle_adjustment->bae->max_num_iterations);
+  AddDefaultOption("BundleAdjustmentBae.use_gpu",
+                   &bundle_adjustment->bae->use_gpu);
+  AddDefaultOption("BundleAdjustmentBae.gpu_index",
+                   &bundle_adjustment->bae->gpu_index);
+#endif
 }
 
 void OptionManager::AddMapperOptions() {

@@ -5,6 +5,7 @@ Provides ColmapReproj (COLMAP-compatible projection model) and a solve()
 entry point that runs BAE's Levenberg-Marquardt optimizer.
 """
 
+import logging
 import math
 
 import numpy as np
@@ -15,6 +16,8 @@ from bae.autograd.function import TrackingTensor, map_transform
 from bae.optim import LM
 from bae.utils.ba import rotate_quat
 from bae.utils.pysolvers import PCG
+
+logger = logging.getLogger("colmap.bae")
 
 
 @map_transform
@@ -181,6 +184,14 @@ def solve(
     refine_focal_length = options_dict.get("refine_focal_length", True)
     refine_extra_params = options_dict.get("refine_extra_params", True)
 
+    n_imgs = camera_params_np.size // 10
+    n_pts = points_3d_np.size // 3
+    n_obs = camera_indices_np.size
+    logger.info(
+        "BAE solver: %d images, %d points, %d observations, device=%s",
+        n_imgs, n_pts, n_obs, device,
+    )
+
     # Convert numpy arrays to tensors and reshape.
     camera_params = torch.tensor(
         camera_params_np, dtype=torch.float64, device=device
@@ -227,6 +238,7 @@ def solve(
 
     # Compute initial cost.
     initial_cost = model.loss(input_data, None).item()
+    logger.info("BAE initial cost: %.6f", initial_cost)
 
     # Run optimization loop.
     num_iterations = 0
@@ -237,11 +249,22 @@ def solve(
         loss = optimizer.step(input_data)
         num_iterations += 1
         final_cost = loss.item()
+        logger.info(
+            "BAE iter %3d  cost=%.6f  rel_change=%.2e",
+            num_iterations,
+            final_cost,
+            abs(prev_cost - final_cost) / max(prev_cost, 1e-12),
+        )
         rel_change = abs(prev_cost - final_cost) / max(prev_cost, 1e-12)
         if rel_change < 1e-6:
             converged = True
             break
         prev_cost = final_cost
+
+    logger.info(
+        "BAE finished: %d iterations, cost %.6f -> %.6f, converged=%s",
+        num_iterations, initial_cost, final_cost, converged,
+    )
 
     return {
         "camera_params": model.pose.detach().cpu().numpy(),

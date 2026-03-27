@@ -2,8 +2,20 @@
 
 #include "colmap/sensor/models.h"
 #include "colmap/util/logging.h"
+#include "colmap/util/timer.h"
 
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
 #include <unordered_map>
+
+#include <pybind11/embed.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+namespace py = pybind11;
 
 namespace colmap {
 
@@ -45,12 +57,153 @@ class BaeBundleAdjuster : public BundleAdjuster {
   std::shared_ptr<BundleAdjustmentSummary> Solve() override {
     auto summary = std::make_shared<BaeBundleAdjustmentSummary>();
     summary->termination_type = BundleAdjustmentTerminationType::FAILURE;
-    LOG(WARNING) << "BAE bundle adjustment solver not yet implemented";
+    summary->num_residuals = static_cast<int>(num_observations_ * 2);
+
+    // C1: Ensure Python interpreter is available.
+    // CLI mode: no interpreter running -> initialize once, release GIL.
+    // pycolmap mode: interpreter already running -> skip initialization.
+    static std::once_flag py_init_flag;
+    std::call_once(py_init_flag, []() {
+      if (!Py_IsInitialized()) {
+        py::initialize_interpreter();
+        // Release GIL so we don't hold it between Solve() calls.
+        PyEval_SaveThread();
+      }
+    });
+
+    // Acquire the GIL for the duration of this call.
+    py::gil_scoped_acquire gil;
+
+    Timer timer;
+    timer.Start();
+
+    try {
+      // Import the BAE solver module.
+      // pycolmap mode: import as package submodule (pycolmap._core available).
+      // CLI mode: pycolmap.__init__ fails (no _core), load by file path.
+      py::module_ bae_solver;
+      try {
+        bae_solver = py::module_::import("pycolmap.bae_solver");
+      } catch (py::error_already_set&) {
+#ifdef BAE_SOLVER_MODULE_DIR
+        py::module_ importlib_util =
+            py::module_::import("importlib.util");
+        const std::string solver_path =
+            std::string(BAE_SOLVER_MODULE_DIR) +
+            "/pycolmap/bae_solver.py";
+        auto spec = importlib_util.attr("spec_from_file_location")(
+            "bae_solver", solver_path);
+        THROW_CHECK(spec.ptr() != nullptr)
+            << "Cannot find BAE solver module at " << solver_path;
+        bae_solver = importlib_util.attr("module_from_spec")(spec);
+        spec.attr("loader").attr("exec_module")(bae_solver);
+#else
+        throw;
+#endif
+      }
+
+      // Wrap C++ vectors as numpy arrays (zero-copy views into member data).
+      const auto si = [](size_t n) { return static_cast<py::ssize_t>(n); };
+
+      py::array_t<double> cam_arr({si(num_images_), si(10)},
+                                  camera_params_.data());
+      py::array_t<double> pts3d_arr({si(num_points_), si(3)},
+                                    points_3d_.data());
+      py::array_t<double> pts2d_arr({si(num_observations_), si(2)},
+                                    points_2d_.data());
+      py::array_t<int> cam_idx_arr({si(num_observations_)},
+                                   camera_indices_.data());
+      py::array_t<int> pt_idx_arr({si(num_observations_)},
+                                  point_indices_.data());
+      py::array_t<uint8_t> const_cam_arr({si(num_images_)},
+                                         constant_camera_mask_.data());
+      py::array_t<uint8_t> const_pt_arr({si(num_points_)},
+                                        constant_point_mask_.data());
+
+      // Build options dict from BaeBundleAdjustmentOptions + refine_* flags.
+      py::dict options_dict;
+      if (options_.bae) {
+        options_dict["max_num_iterations"] =
+            options_.bae->max_num_iterations;
+        options_dict["use_gpu"] = options_.bae->use_gpu;
+        options_dict["gpu_index"] = options_.bae->gpu_index;
+      }
+      options_dict["refine_focal_length"] = options_.refine_focal_length;
+      options_dict["refine_extra_params"] = options_.refine_extra_params;
+
+      // Call the Python BAE solver.
+      py::dict result = bae_solver.attr("solve")(cam_arr,
+                                                 pts3d_arr,
+                                                 pts2d_arr,
+                                                 cam_idx_arr,
+                                                 pt_idx_arr,
+                                                 const_cam_arr,
+                                                 const_pt_arr,
+                                                 options_dict);
+
+      // Parse convergence info into summary.
+      summary->num_iterations = result["num_iterations"].cast<int>();
+      summary->initial_cost = result["initial_cost"].cast<double>();
+      summary->final_cost = result["final_cost"].cast<double>();
+      const bool converged = result["converged"].cast<bool>();
+      summary->termination_type =
+          converged ? BundleAdjustmentTerminationType::CONVERGENCE
+                    : BundleAdjustmentTerminationType::NO_CONVERGENCE;
+
+      // Copy optimized parameters back into member arrays for writeback.
+      auto opt_cam = result["camera_params"].cast<py::array_t<double>>();
+      auto opt_pts = result["points_3d"].cast<py::array_t<double>>();
+      std::memcpy(camera_params_.data(),
+                  opt_cam.data(),
+                  camera_params_.size() * sizeof(double));
+      std::memcpy(points_3d_.data(),
+                  opt_pts.data(),
+                  points_3d_.size() * sizeof(double));
+    } catch (py::error_already_set& e) {
+      LOG(ERROR) << "BAE Python error: " << e.what();
+      return summary;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "BAE solver error: " << e.what();
+      return summary;
+    }
+
+    timer.Pause();
+
+    if (options_.print_summary || VLOG_IS_ON(1)) {
+      PrintBaeSolverSummary(*summary, timer.ElapsedSeconds());
+    }
+
     return summary;
   }
 
  private:
   void SetupProblem();
+
+  static void PrintBaeSolverSummary(
+      const BaeBundleAdjustmentSummary& summary, double elapsed_seconds) {
+    std::ostringstream log;
+    log << "BAE bundle adjustment report\n";
+    log << std::right << std::setw(16) << "Residuals : " << std::left
+        << summary.num_residuals << '\n';
+    log << std::right << std::setw(16) << "Iterations : " << std::left
+        << summary.num_iterations << '\n';
+    log << std::right << std::setw(16) << "Time : " << std::left
+        << elapsed_seconds << " [s]\n";
+    log << std::right << std::setw(16) << "Initial cost : " << std::right
+        << std::setprecision(6)
+        << std::sqrt(summary.initial_cost /
+                     std::max(summary.num_residuals, 1))
+        << " [px]\n";
+    log << std::right << std::setw(16) << "Final cost : " << std::right
+        << std::setprecision(6)
+        << std::sqrt(summary.final_cost /
+                     std::max(summary.num_residuals, 1))
+        << " [px]\n";
+    log << std::right << std::setw(16) << "Termination : " << std::right
+        << BundleAdjustmentTerminationTypeToString(summary.termination_type)
+        << "\n\n";
+    LOG(INFO) << log.str();
+  }
 
   Reconstruction& reconstruction_;
 
@@ -211,9 +364,9 @@ void BaeBundleAdjuster::SetupProblem() {
       if (config_.IsIgnoredPoint(point2D.point3D_id)) continue;
       auto it = point3D_id_to_idx_.find(point2D.point3D_id);
       if (it == point3D_id_to_idx_.end()) continue;
-      // C2: center around principal point with BAE sign convention.
-      points_2d_.push_back(cx - point2D.xy.x());
-      points_2d_.push_back(cy - point2D.xy.y());
+      // Center around principal point (COLMAP convention: obs - cx).
+      points_2d_.push_back(point2D.xy.x() - cx);
+      points_2d_.push_back(point2D.xy.y() - cy);
       camera_indices_.push_back(static_cast<int>(cam_idx));
       point_indices_.push_back(static_cast<int>(it->second));
       ++num_observations_;
@@ -276,8 +429,8 @@ void BaeBundleAdjuster::SetupProblem() {
       const double cx = ext_camera.params[1];
       const double cy = ext_camera.params[2];
       const auto& ext_pt2D = ext_image.Point2D(track_el.point2D_idx);
-      points_2d_.push_back(cx - ext_pt2D.xy.x());
-      points_2d_.push_back(cy - ext_pt2D.xy.y());
+      points_2d_.push_back(ext_pt2D.xy.x() - cx);
+      points_2d_.push_back(ext_pt2D.xy.y() - cy);
       camera_indices_.push_back(static_cast<int>(ext_cam_idx));
       point_indices_.push_back(static_cast<int>(pt_it->second));
       ++num_observations_;

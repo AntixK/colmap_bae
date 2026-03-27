@@ -80,6 +80,10 @@ if(BAE_ENABLED)
             pybind11::embed
             Python3::Python
     )
+    target_compile_definitions(colmap_estimators
+        PRIVATE
+            BAE_SOLVER_MODULE_DIR="${CMAKE_SOURCE_DIR}/python"
+    )
 endif()
 
 COLMAP_ADD_TEST(

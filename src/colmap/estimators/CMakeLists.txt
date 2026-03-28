@@ -76,7 +76,7 @@ if(BAE_ENABLED)
             bundle_adjustment_bae.cc
     )
     target_link_libraries(colmap_estimators
-        PUBLIC
+        PRIVATE
             pybind11::embed
             Python3::Python
     )

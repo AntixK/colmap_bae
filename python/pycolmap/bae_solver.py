@@ -177,6 +177,7 @@ def solve(
     gpu_index = options_dict.get("gpu_index", "0")
     if use_gpu and torch.cuda.is_available():
         device = f"cuda:{gpu_index}"
+        torch.cuda.empty_cache()
     else:
         device = "cpu"
 
@@ -192,49 +193,61 @@ def solve(
         n_imgs, n_pts, n_obs, device,
     )
 
-    # Convert numpy arrays to tensors and reshape.
-    camera_params = torch.tensor(
-        camera_params_np, dtype=torch.float64, device=device
-    ).reshape(-1, 10)
-    points_3d = torch.tensor(
-        points_3d_np, dtype=torch.float64, device=device
-    ).reshape(-1, 3)
-    points_2d = torch.tensor(
-        points_2d_np, dtype=torch.float64, device=device
-    ).reshape(-1, 2)
-    camera_indices = torch.tensor(
-        camera_indices_np, dtype=torch.long, device=device
-    )
-    point_indices = torch.tensor(
-        point_indices_np, dtype=torch.long, device=device
-    )
-    constant_camera_mask = torch.tensor(
-        constant_camera_mask_np, dtype=torch.bool, device=device
-    )
-    constant_point_mask = torch.tensor(
-        constant_point_mask_np, dtype=torch.bool, device=device
-    )
+    def _build(device):
+        """Allocate tensors, model, and optimizer on the given device."""
+        camera_params = torch.tensor(
+            camera_params_np, dtype=torch.float64, device=device
+        ).reshape(-1, 10)
+        points_3d = torch.tensor(
+            points_3d_np, dtype=torch.float64, device=device
+        ).reshape(-1, 3)
+        points_2d = torch.tensor(
+            points_2d_np, dtype=torch.float64, device=device
+        ).reshape(-1, 2)
+        camera_indices = torch.tensor(
+            camera_indices_np, dtype=torch.long, device=device
+        )
+        point_indices = torch.tensor(
+            point_indices_np, dtype=torch.long, device=device
+        )
+        constant_camera_mask = torch.tensor(
+            constant_camera_mask_np, dtype=torch.bool, device=device
+        )
+        constant_point_mask = torch.tensor(
+            constant_point_mask_np, dtype=torch.bool, device=device
+        )
 
-    # Build model and optimizer.
-    model = ColmapReproj(camera_params, points_3d).to(device)
-    strategy = pp.optim.strategy.TrustRegion(up=2.0, down=0.5**4)
-    solver = PCG(tol=1e-4, maxiter=250)
-    optimizer = ColmapLM(
-        model,
-        constant_camera_mask=constant_camera_mask,
-        constant_point_mask=constant_point_mask,
-        refine_focal_length=refine_focal_length,
-        refine_extra_params=refine_extra_params,
-        strategy=strategy,
-        solver=solver,
-        reject=30,
-    )
+        model = ColmapReproj(camera_params, points_3d).to(device)
+        strategy = pp.optim.strategy.TrustRegion(up=2.0, down=0.5**4)
+        solver = PCG(tol=1e-4, maxiter=250)
+        optimizer = ColmapLM(
+            model,
+            constant_camera_mask=constant_camera_mask,
+            constant_point_mask=constant_point_mask,
+            refine_focal_length=refine_focal_length,
+            refine_extra_params=refine_extra_params,
+            strategy=strategy,
+            solver=solver,
+            reject=30,
+        )
 
-    input_data = {
-        "points_2d": points_2d,
-        "camera_indices": camera_indices,
-        "point_indices": point_indices,
-    }
+        input_data = {
+            "points_2d": points_2d,
+            "camera_indices": camera_indices,
+            "point_indices": point_indices,
+        }
+        return model, optimizer, input_data
+
+    try:
+        model, optimizer, input_data = _build(device)
+    except torch.cuda.OutOfMemoryError:
+        logger.warning(
+            "CUDA out of memory on %s (%d obs), falling back to CPU",
+            device, n_obs,
+        )
+        torch.cuda.empty_cache()
+        device = "cpu"
+        model, optimizer, input_data = _build(device)
 
     # Compute initial cost.
     initial_cost = model.loss(input_data, None).item()
@@ -245,21 +258,46 @@ def solve(
     final_cost = initial_cost
     converged = False
     prev_cost = initial_cost
-    for _ in range(max_iterations):
-        loss = optimizer.step(input_data)
-        num_iterations += 1
-        final_cost = loss.item()
-        logger.info(
-            "BAE iter %3d  cost=%.6f  rel_change=%.2e",
-            num_iterations,
-            final_cost,
-            abs(prev_cost - final_cost) / max(prev_cost, 1e-12),
+
+    def _run_loop(model, optimizer, input_data, prev_cost):
+        num_iterations = 0
+        final_cost = prev_cost
+        converged = False
+        for _ in range(max_iterations):
+            loss = optimizer.step(input_data)
+            num_iterations += 1
+            final_cost = loss.item()
+            logger.info(
+                "BAE iter %3d  cost=%.6f  rel_change=%.2e",
+                num_iterations,
+                final_cost,
+                abs(prev_cost - final_cost) / max(prev_cost, 1e-12),
+            )
+            rel_change = abs(prev_cost - final_cost) / max(prev_cost, 1e-12)
+            if rel_change < 1e-6:
+                converged = True
+                break
+            prev_cost = final_cost
+        return num_iterations, final_cost, converged
+
+    try:
+        num_iterations, final_cost, converged = _run_loop(
+            model, optimizer, input_data, prev_cost,
         )
-        rel_change = abs(prev_cost - final_cost) / max(prev_cost, 1e-12)
-        if rel_change < 1e-6:
-            converged = True
-            break
-        prev_cost = final_cost
+    except torch.cuda.OutOfMemoryError:
+        if device == "cpu":
+            raise
+        logger.warning(
+            "CUDA out of memory during optimization, falling back to CPU",
+        )
+        torch.cuda.empty_cache()
+        device = "cpu"
+        model, optimizer, input_data = _build(device)
+        initial_cost = model.loss(input_data, None).item()
+        prev_cost = initial_cost
+        num_iterations, final_cost, converged = _run_loop(
+            model, optimizer, input_data, prev_cost,
+        )
 
     logger.info(
         "BAE finished: %d iterations, cost %.6f -> %.6f, converged=%s",

@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -78,29 +79,44 @@ class BaeBundleAdjuster : public BundleAdjuster {
     timer.Start();
 
     try {
-      // Import the BAE solver module.
-      // pycolmap mode: import as package submodule (pycolmap._core available).
-      // CLI mode: pycolmap.__init__ fails (no _core), load by file path.
-      py::module_ bae_solver;
-      try {
-        bae_solver = py::module_::import("pycolmap.bae_solver");
-      } catch (py::error_already_set&) {
+      // Load bae_solver.py directly by file path.  We must NOT import the
+      // pycolmap package (its __init__.py loads _core.so which calls
+      // InitGoogleLogging, fatal when glog is already initialized by CLI).
+      //
+      // Search order:
+      //  1. Compile-time source tree path (development builds).
+      //  2. Locate the installed pycolmap package directory on sys.path
+      //     using find_spec (does NOT execute __init__.py).
+      std::string solver_path;
 #ifdef BAE_SOLVER_MODULE_DIR
+      solver_path =
+          std::string(BAE_SOLVER_MODULE_DIR) + "/pycolmap/bae_solver.py";
+#endif
+      if (solver_path.empty() || !std::filesystem::exists(solver_path)) {
+        // find_spec locates the package without importing it.
         py::module_ importlib_util =
             py::module_::import("importlib.util");
-        const std::string solver_path =
-            std::string(BAE_SOLVER_MODULE_DIR) +
-            "/pycolmap/bae_solver.py";
-        auto spec = importlib_util.attr("spec_from_file_location")(
-            "bae_solver", solver_path);
-        THROW_CHECK(spec.ptr() != nullptr)
-            << "Cannot find BAE solver module at " << solver_path;
-        bae_solver = importlib_util.attr("module_from_spec")(spec);
-        spec.attr("loader").attr("exec_module")(bae_solver);
-#else
-        throw;
-#endif
+        py::object pkg_spec =
+            importlib_util.attr("find_spec")("pycolmap");
+        THROW_CHECK(!pkg_spec.is_none())
+            << "Cannot find pycolmap package on sys.path";
+        std::string pkg_dir =
+            pkg_spec.attr("submodule_search_locations")
+                .cast<py::list>()[0]
+                .cast<std::string>();
+        solver_path = pkg_dir + "/bae_solver.py";
       }
+      THROW_CHECK(std::filesystem::exists(solver_path))
+          << "Cannot find BAE solver module at " << solver_path;
+      LOG(INFO) << "BAE solver module: " << solver_path;
+
+      py::module_ importlib_util =
+          py::module_::import("importlib.util");
+      auto file_spec = importlib_util.attr("spec_from_file_location")(
+          "bae_solver", solver_path);
+      py::module_ bae_solver =
+          importlib_util.attr("module_from_spec")(file_spec);
+      file_spec.attr("loader").attr("exec_module")(bae_solver);
 
       // Wrap C++ vectors as numpy arrays (zero-copy views into member data).
       const auto si = [](size_t n) { return static_cast<py::ssize_t>(n); };

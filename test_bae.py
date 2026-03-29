@@ -115,6 +115,7 @@ def main():
         "--image_path", str(image_dir),
         "--output_path", str(sparse_dir),
         "--GlobalMapper.ba_backend", "BAE",
+        "--GlobalMapper.track_required_tracks_per_view", "10000",
     ])
 
     # Find the reconstruction directory (usually sparse/0/).

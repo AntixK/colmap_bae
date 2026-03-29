@@ -1,4 +1,4 @@
-"""End-to-end test for COLMAP BAE bundle adjustment (Phase 4).
+"""End-to-end test for COLMAP BAE bundle adjustment.
 
 Run inside the Docker container:
     docker/launch.sh
@@ -6,15 +6,11 @@ Run inside the Docker container:
 
 Steps:
     1. Extract SIFT features via colmap CLI.
-    2. Exhaustive matching via colmap CLI.
-    3. Reconstruction via colmap global_mapper CLI (GLOMAP + Ceres BA).
-    4. Standalone BAE bundle adjustment via colmap CLI.
-    5. Validate that the BAE solver pipeline ran correctly.
-
-Note: Phase 5 (writeback) is not yet implemented, so the BAE-optimized
-parameters are NOT written back to the Reconstruction.  The output model
-will be identical to the input.  This test validates that the BAE solver
-runs end-to-end without errors (extraction, Python call, convergence).
+    2. Sequential matching via colmap CLI.
+    3. View graph calibration (refine focal lengths, filter bad pairs).
+    4. Reconstruction via colmap global_mapper CLI (GLOMAP + BAE BA).
+    5. Standalone BAE bundle adjustment via colmap CLI.
+    6. Validate that the BAE solver pipeline ran correctly.
 """
 
 import shutil
@@ -100,9 +96,19 @@ def main():
     check(True, "Sequential matching succeeded")
 
     # ------------------------------------------------------------------
-    # Step 3: Global reconstruction (GLOMAP)
+    # Step 3: View graph calibration
     # ------------------------------------------------------------------
-    print("\n== Step 3: Global mapping (GLOMAP) ==")
+    print("\n== Step 3: View graph calibration ==")
+    run([
+        "colmap", "view_graph_calibrator",
+        "--database_path", str(database_path),
+    ])
+    check(True, "View graph calibration succeeded")
+
+    # ------------------------------------------------------------------
+    # Step 4: Global reconstruction (GLOMAP)
+    # ------------------------------------------------------------------
+    print("\n== Step 4: Global mapping (GLOMAP + BAE) ==")
     run([
         "colmap", "global_mapper",
         "--database_path", str(database_path),
@@ -123,9 +129,9 @@ def main():
     print(f"  Using model: {model_dir}")
 
     # ------------------------------------------------------------------
-    # Step 4: BAE bundle adjustment
+    # Step 5: BAE bundle adjustment
     # ------------------------------------------------------------------
-    print("\n== Step 4: BAE bundle adjustment ==")
+    print("\n== Step 5: BAE bundle adjustment ==")
     # Capture output for BAE-specific validation (bundle_adjuster returns 0
     # even when BAE fails internally, so we must inspect the logs).
     bae_result = subprocess.run(
@@ -141,9 +147,9 @@ def main():
     print(bae_output)
 
     # ------------------------------------------------------------------
-    # Step 5: Validation
+    # Step 6: Validation
     # ------------------------------------------------------------------
-    print("\n== Step 5: Validation ==")
+    print("\n== Step 6: Validation ==")
 
     check(bae_result.returncode == 0, f"Exit code is 0 (got {bae_result.returncode})")
     check("BAE extraction:" in bae_output, "BAE extraction ran")
@@ -153,7 +159,7 @@ def main():
         "BAE solver completed and printed report",
     )
 
-    # Output reconstruction written (content same as input until Phase 5).
+    # Output reconstruction written (BAE results written back to model).
     for fname in ("cameras.bin", "images.bin", "points3D.bin"):
         fpath = bae_output_dir / fname
         check(

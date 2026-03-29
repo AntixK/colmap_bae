@@ -11,6 +11,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
@@ -319,21 +320,11 @@ void BaeBundleAdjuster::SetupProblem() {
         << "BAE does not support multi-sensor rigs";
   }
 
-  // Build image_id -> contiguous index map and camera_id -> index map.
-  for (const image_t image_id : config_.Images()) {
-    image_id_to_idx_[image_id] = num_images_++;
-    const auto& image = reconstruction_.Image(image_id);
-    camera_t cam_id = image.CameraId();
-    if (camera_id_to_idx_.count(cam_id) == 0) {
-      camera_id_to_idx_[cam_id] = num_cameras_++;
-    }
-  }
-
-  // Collect point3D_ids observed in config images
-  // i.e. for each 2D point in the images, if it has a corresponding 3D point,
-  // then add it 3D point for BA optimization.
-  // Skip ignored points and points with track length < min_track_length.
-  // These points will not be included in the BA optimization.
+  // First pass: collect point3D_ids and discover which images have
+  // observations.  Only images with at least one valid observation are
+  // included in the BA problem — this avoids zero-Jacobian columns that
+  // trigger sparse-solver bugs in BAE.
+  std::unordered_set<image_t> images_with_obs;
   for (const image_t image_id : config_.Images()) {
     const auto& image = reconstruction_.Image(image_id);
     for (const auto& point2D : image.Points2D()) {
@@ -348,6 +339,19 @@ void BaeBundleAdjuster::SetupProblem() {
       if (point3D_id_to_idx_.count(point2D.point3D_id) == 0) {
         point3D_id_to_idx_[point2D.point3D_id] = num_points_++;
       }
+      images_with_obs.insert(image_id);
+    }
+  }
+
+  // Build image_id -> contiguous index map and camera_id -> index map,
+  // including only images that have at least one observation.
+  for (const image_t image_id : config_.Images()) {
+    if (images_with_obs.count(image_id) == 0) continue;
+    image_id_to_idx_[image_id] = num_images_++;
+    const auto& image = reconstruction_.Image(image_id);
+    camera_t cam_id = image.CameraId();
+    if (camera_id_to_idx_.count(cam_id) == 0) {
+      camera_id_to_idx_[cam_id] = num_cameras_++;
     }
   }
 

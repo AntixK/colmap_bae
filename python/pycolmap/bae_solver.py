@@ -16,6 +16,30 @@ import numpy as np
 import pypose as pp
 import torch
 import torch.nn as nn
+
+# BAE bug: diagonal_op_'s Triton path computes diag_mask but not
+# 'indices', which the fallback branch (missing diagonal blocks) needs.
+# InstantSFM avoids this because its problems always have fully-populated
+# diagonals.  Patch only the failing branch; Triton stays active for the
+# common fast path.
+import bae.sparse.py_ops as _bae_py_ops
+_orig_diagonal_op_ = _bae_py_ops.diagonal_op_
+
+
+def _patched_diagonal_op_(input, offset=0, op=None):
+    try:
+        return _orig_diagonal_op_(input, offset=offset, op=op)
+    except UnboundLocalError:
+        old = _bae_py_ops.USE_TRITON
+        _bae_py_ops.USE_TRITON = False
+        try:
+            return _orig_diagonal_op_(input, offset=offset, op=op)
+        finally:
+            _bae_py_ops.USE_TRITON = old
+
+
+_bae_py_ops.diagonal_op_ = _patched_diagonal_op_
+
 from bae.autograd.function import TrackingTensor, map_transform
 from bae.optim import LM
 from bae.utils.ba import rotate_quat

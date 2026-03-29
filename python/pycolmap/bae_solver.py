@@ -3,6 +3,10 @@
 Called from C++ BaeBundleAdjuster::Solve() via pybind11 embedded Python.
 Provides ColmapReproj (COLMAP-compatible projection model) and a solve()
 entry point that runs BAE's Levenberg-Marquardt optimizer.
+
+Following InstantSFM's architecture, extrinsics (per-image SE3 poses) and
+intrinsics (per-camera [f, k1, k2]) are stored as separate nn.Parameters.
+This produces sparser Jacobian blocks in BAE and reduces GPU memory usage.
 """
 
 import logging
@@ -16,19 +20,23 @@ from bae.autograd.function import TrackingTensor, map_transform
 from bae.optim import LM
 from bae.utils.ba import rotate_quat
 from bae.utils.pysolvers import PCG
+from pypose.optim.kernel import Huber
 
 logger = logging.getLogger("colmap.bae")
 
 
 @map_transform
-def colmap_project(points, camera_params):
-    """Project 3D points using COLMAP's SIMPLERADIAL camera model.
+def colmap_project(points, extrinsics, intrinsics):
+    """Project 3D points using COLMAP's SIMPLERADIAL/Radial camera model.
 
     Unlike BAE's default project() which negates the projection
     (BAL dataset convention: -X/Z), this follows COLMAP's standard
     pinhole model: u = X/Z, v = Y/Z (no negation).
 
-    Camera params layout per image: [tx,ty,tz, qx,qy,qz,qw, f, k1, k2]
+    Args:
+        points:     (N, 3) world-space 3D points
+        extrinsics: (N, 7) per-observation [tx,ty,tz, qx,qy,qz,qw]
+        intrinsics: (N, 3) per-observation [f, k1, k2]
 
     Observed 2D points are pre-centered on the C++ side as
     (obs_x - cx, obs_y - cy), so cx,cy do not appear here.
@@ -43,13 +51,13 @@ def colmap_project(points, camera_params):
     This matches COLMAP's SimpleRadial/Radial camera models exactly.
     """
     # SE3 transform: p_cam = R * p_world + t
-    points_proj = rotate_quat(points, camera_params[..., :7])
+    points_proj = rotate_quat(points, extrinsics)
     # Perspective division WITHOUT negation (COLMAP convention).
     points_proj = points_proj[..., :2] / points_proj[..., 2].unsqueeze(-1)
     # Radial distortion: d = 1 + k1*r^2 + k2*r^4
-    f = camera_params[..., -3].unsqueeze(-1)
-    k1 = camera_params[..., -2].unsqueeze(-1)
-    k2 = camera_params[..., -1].unsqueeze(-1)
+    f = intrinsics[..., 0].unsqueeze(-1)
+    k1 = intrinsics[..., 1].unsqueeze(-1)
+    k2 = intrinsics[..., 2].unsqueeze(-1)
     n = torch.sum(points_proj**2, dim=-1, keepdim=True)
     r = 1 + k1 * n + k2 * n**2
     points_proj = points_proj * r * f
@@ -59,24 +67,25 @@ def colmap_project(points, camera_params):
 class ColmapReproj(nn.Module):
     """COLMAP-compatible reprojection model for BAE optimizer.
 
-    Unlike BAE's default Reproj (ba_helpers.py), this uses COLMAP's
-    projection convention (no negation in perspective division).
-
-    Parameters are stored as:
-      pose:      (N_imgs, 10) [tx,ty,tz, qx,qy,qz,qw, f, k1, k2]
-      points_3d: (N_pts, 3)   [x, y, z]
+    Following InstantSFM's architecture, parameters are stored as
+    three separate nn.Parameter blocks for sparser Jacobians:
+      extrinsics: (N_imgs, 7)  [tx,ty,tz, qx,qy,qz,qw]
+      intrinsics: (N_cams, 3)  [f, k1, k2]
+      points_3d:  (N_pts, 3)   [x, y, z]
     """
 
-    def __init__(self, camera_params, points_3d):
+    def __init__(self, extrinsics, intrinsics, points_3d):
         super().__init__()
-        self.pose = nn.Parameter(TrackingTensor(camera_params))
+        self.extrinsics = nn.Parameter(TrackingTensor(extrinsics))
+        self.intrinsics = nn.Parameter(TrackingTensor(intrinsics))
         self.points_3d = nn.Parameter(TrackingTensor(points_3d))
-        self.pose.trim_SE3_grad = True
+        self.extrinsics.trim_SE3_grad = True
 
-    def forward(self, points_2d, camera_indices, point_indices):
+    def forward(self, points_2d, image_indices, camera_indices, point_indices):
         points_proj = colmap_project(
             self.points_3d[point_indices],
-            self.pose[camera_indices],
+            self.extrinsics[image_indices],
+            self.intrinsics[camera_indices],
         )
         return points_proj - points_2d
 
@@ -92,24 +101,23 @@ class ColmapReproj(nn.Module):
 class ColmapLM(LM):
     """LM optimizer with support for freezing individual cameras/points.
 
-    Overrides update_parameter to zero out updates for:
-    - Cameras marked constant by constant_camera_mask (pose + intrinsics)
-    - Focal length globally (when refine_focal_length=False)
-    - Distortion params globally (when refine_extra_params=False)
-    - Points marked constant by constant_point_mask
+    Handles 3 separate parameter blocks (identified by identity):
+      extrinsics: SE3 manifold update, frozen by constant_pose_mask
+      intrinsics: Euclidean update, controlled by refine_focal_length/extra_params
+      points_3d:  Euclidean update, frozen by constant_point_mask
     """
 
     def __init__(
         self,
         model,
-        constant_camera_mask,
+        constant_pose_mask,
         constant_point_mask,
         refine_focal_length=True,
         refine_extra_params=True,
         **kwargs,
     ):
         super().__init__(model, **kwargs)
-        self.constant_camera_mask = constant_camera_mask
+        self.constant_pose_mask = constant_pose_mask
         self.constant_point_mask = constant_point_mask
         self.refine_focal_length = refine_focal_length
         self.refine_extra_params = refine_extra_params
@@ -128,45 +136,46 @@ class ColmapLM(LM):
         for param, d in zip(params, steps):
             if not param.requires_grad:
                 continue
-            if getattr(param, "trim_SE3_grad", False):
-                # Camera update: d shape (N_imgs * 9,) -> (N_imgs, 9)
-                # Layout after SE3 trimming: [se3(6), df, dk1, dk2]
+            if param is self.model.extrinsics:
+                # Extrinsics: d shape (N_imgs * 6,) -> (N_imgs, 6)
                 d = d.view(param.shape[0], -1).clone()
-                # Freeze pose + intrinsics for constant cameras.
-                d[self.constant_camera_mask] = 0
-                # Freeze focal length globally if not refining.
-                if not self.refine_focal_length:
-                    d[:, 6] = 0
-                # Freeze distortion params globally if not refining.
-                if not self.refine_extra_params:
-                    d[:, 7:] = 0
+                d[self.constant_pose_mask] = 0
                 param[..., :7] = pp.SE3(param[..., :7]).add_(
                     pp.se3(d[..., :6])
                 )
-                if param.shape[-1] > 7:
-                    param[:, 7:] += d[:, 6:]
+            elif param is self.model.intrinsics:
+                # Intrinsics: d shape (N_cams * 3,) -> (N_cams, 3)
+                d = d.view(param.shape).clone()
+                if not self.refine_focal_length:
+                    d[:, 0] = 0
+                if not self.refine_extra_params:
+                    d[:, 1:] = 0
+                param.add_(d)
             else:
-                # Point update: d shape (N_pts * 3,) -> (N_pts, 3)
+                # Points: d shape (N_pts * 3,) -> (N_pts, 3)
                 d = d.view(param.shape).clone()
                 d[self.constant_point_mask] = 0
                 param.add_(d)
 
 
 def solve(
-    camera_params_np,
+    extrinsics_np,
+    intrinsics_np,
     points_3d_np,
     points_2d_np,
+    image_indices_np,
     camera_indices_np,
     point_indices_np,
-    constant_camera_mask_np,
+    constant_pose_mask_np,
     constant_point_mask_np,
     options_dict,
 ):
     """Entry point called from C++ BaeBundleAdjuster::Solve().
 
     All array inputs are numpy arrays (flat or shaped). Returns a dict:
-      camera_params:  optimized (N_imgs, 10) numpy array
-      points_3d:      optimized (N_pts, 3)   numpy array
+      extrinsics:     optimized (N_imgs, 7) numpy array
+      intrinsics:     optimized (N_cams, 3) numpy array
+      points_3d:      optimized (N_pts, 3)  numpy array
       num_iterations: int
       initial_cost:   float
       final_cost:     float
@@ -184,55 +193,69 @@ def solve(
     max_iterations = options_dict.get("max_num_iterations", 100)
     refine_focal_length = options_dict.get("refine_focal_length", True)
     refine_extra_params = options_dict.get("refine_extra_params", True)
+    loss_function_scale = options_dict.get("loss_function_scale", 1.0)
 
-    n_imgs = camera_params_np.size // 10
+    n_imgs = extrinsics_np.size // 7
+    n_cams = intrinsics_np.size // 3
     n_pts = points_3d_np.size // 3
-    n_obs = camera_indices_np.size
+    n_obs = image_indices_np.size
     logger.info(
-        "BAE solver: %d images, %d points, %d observations, device=%s",
-        n_imgs, n_pts, n_obs, device,
+        "BAE solver: %d images, %d cameras, %d points, %d observations, "
+        "device=%s",
+        n_imgs, n_cams, n_pts, n_obs, device,
     )
 
     def _build(device):
         """Allocate tensors, model, and optimizer on the given device."""
-        camera_params = torch.tensor(
-            camera_params_np, dtype=torch.float64, device=device
-        ).reshape(-1, 10)
+        extrinsics = torch.tensor(
+            extrinsics_np, dtype=torch.float64, device=device
+        ).reshape(-1, 7)
+        intrinsics = torch.tensor(
+            intrinsics_np, dtype=torch.float64, device=device
+        ).reshape(-1, 3)
         points_3d = torch.tensor(
             points_3d_np, dtype=torch.float64, device=device
         ).reshape(-1, 3)
         points_2d = torch.tensor(
             points_2d_np, dtype=torch.float64, device=device
         ).reshape(-1, 2)
+        image_indices = torch.tensor(
+            image_indices_np, dtype=torch.long, device=device
+        )
         camera_indices = torch.tensor(
             camera_indices_np, dtype=torch.long, device=device
         )
         point_indices = torch.tensor(
             point_indices_np, dtype=torch.long, device=device
         )
-        constant_camera_mask = torch.tensor(
-            constant_camera_mask_np, dtype=torch.bool, device=device
+        constant_pose_mask = torch.tensor(
+            constant_pose_mask_np, dtype=torch.bool, device=device
         )
         constant_point_mask = torch.tensor(
             constant_point_mask_np, dtype=torch.bool, device=device
         )
 
-        model = ColmapReproj(camera_params, points_3d).to(device)
-        strategy = pp.optim.strategy.TrustRegion(up=2.0, down=0.5**4)
-        solver = PCG(tol=1e-4, maxiter=250)
+        model = ColmapReproj(extrinsics, intrinsics, points_3d).to(device)
+        strategy = pp.optim.strategy.TrustRegion(
+            radius=1e4, max=1e10, up=2.0, down=0.5**4,
+        )
+        solver = PCG(tol=1e-5)
+        huber_kernel = Huber(loss_function_scale)
         optimizer = ColmapLM(
             model,
-            constant_camera_mask=constant_camera_mask,
+            constant_pose_mask=constant_pose_mask,
             constant_point_mask=constant_point_mask,
             refine_focal_length=refine_focal_length,
             refine_extra_params=refine_extra_params,
             strategy=strategy,
             solver=solver,
+            kernel=huber_kernel,
             reject=30,
         )
 
         input_data = {
             "points_2d": points_2d,
+            "image_indices": image_indices,
             "camera_indices": camera_indices,
             "point_indices": point_indices,
         }
@@ -305,7 +328,8 @@ def solve(
     )
 
     return {
-        "camera_params": model.pose.detach().cpu().numpy(),
+        "extrinsics": model.extrinsics.detach().cpu().numpy(),
+        "intrinsics": model.intrinsics.detach().cpu().numpy(),
         "points_3d": model.points_3d.detach().cpu().numpy(),
         "num_iterations": num_iterations,
         "initial_cost": initial_cost,

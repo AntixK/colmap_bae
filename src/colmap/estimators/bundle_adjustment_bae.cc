@@ -121,18 +121,22 @@ class BaeBundleAdjuster : public BundleAdjuster {
       // Wrap C++ vectors as numpy arrays (zero-copy views into member data).
       const auto si = [](size_t n) { return static_cast<py::ssize_t>(n); };
 
-      py::array_t<double> cam_arr({si(num_images_), si(10)},
-                                  camera_params_.data());
+      py::array_t<double> extr_arr({si(num_images_), si(7)},
+                                   extrinsics_.data());
+      py::array_t<double> intr_arr({si(num_cameras_), si(3)},
+                                   intrinsics_.data());
       py::array_t<double> pts3d_arr({si(num_points_), si(3)},
                                     points_3d_.data());
       py::array_t<double> pts2d_arr({si(num_observations_), si(2)},
                                     points_2d_.data());
+      py::array_t<int> img_idx_arr({si(num_observations_)},
+                                   image_indices_.data());
       py::array_t<int> cam_idx_arr({si(num_observations_)},
-                                   camera_indices_.data());
+                                   camera_obs_indices_.data());
       py::array_t<int> pt_idx_arr({si(num_observations_)},
                                   point_indices_.data());
-      py::array_t<uint8_t> const_cam_arr({si(num_images_)},
-                                         constant_camera_mask_.data());
+      py::array_t<uint8_t> const_pose_arr({si(num_images_)},
+                                          constant_pose_mask_.data());
       py::array_t<uint8_t> const_pt_arr({si(num_points_)},
                                         constant_point_mask_.data());
 
@@ -148,12 +152,14 @@ class BaeBundleAdjuster : public BundleAdjuster {
       options_dict["refine_extra_params"] = options_.refine_extra_params;
 
       // Call the Python BAE solver.
-      py::dict result = bae_solver.attr("solve")(cam_arr,
+      py::dict result = bae_solver.attr("solve")(extr_arr,
+                                                 intr_arr,
                                                  pts3d_arr,
                                                  pts2d_arr,
+                                                 img_idx_arr,
                                                  cam_idx_arr,
                                                  pt_idx_arr,
-                                                 const_cam_arr,
+                                                 const_pose_arr,
                                                  const_pt_arr,
                                                  options_dict);
 
@@ -166,15 +172,58 @@ class BaeBundleAdjuster : public BundleAdjuster {
           converged ? BundleAdjustmentTerminationType::CONVERGENCE
                     : BundleAdjustmentTerminationType::NO_CONVERGENCE;
 
-      // Copy optimized parameters back into member arrays for writeback.
-      auto opt_cam = result["camera_params"].cast<py::array_t<double>>();
+      // Copy optimized parameters back into member arrays.
+      auto opt_extr = result["extrinsics"].cast<py::array_t<double>>();
+      auto opt_intr = result["intrinsics"].cast<py::array_t<double>>();
       auto opt_pts = result["points_3d"].cast<py::array_t<double>>();
-      std::memcpy(camera_params_.data(),
-                  opt_cam.data(),
-                  camera_params_.size() * sizeof(double));
+      std::memcpy(extrinsics_.data(),
+                  opt_extr.data(),
+                  extrinsics_.size() * sizeof(double));
+      std::memcpy(intrinsics_.data(),
+                  opt_intr.data(),
+                  intrinsics_.size() * sizeof(double));
       std::memcpy(points_3d_.data(),
                   opt_pts.data(),
                   points_3d_.size() * sizeof(double));
+
+      // Write optimized extrinsics back to Reconstruction.
+      for (const auto& [image_id, idx] : image_id_to_idx_) {
+        if (constant_pose_mask_[idx]) continue;
+        const double* p = &extrinsics_[idx * 7];
+        Eigen::Quaterniond q(p[6], p[3], p[4], p[5]);  // qw, qx, qy, qz
+        Eigen::Vector3d t(p[0], p[1], p[2]);
+        auto& image = reconstruction_.Image(image_id);
+        reconstruction_.Frame(image.FrameId())
+            .SetRigFromWorld(Rigid3d(q, t));
+      }
+
+      // Write optimized intrinsics back to Reconstruction.
+      if (options_.refine_focal_length || options_.refine_extra_params) {
+        for (const auto& [cam_id, cidx] : camera_id_to_idx_) {
+          const double* ip = &intrinsics_[cidx * 3];
+          auto& camera = reconstruction_.Camera(cam_id);
+          if (options_.refine_focal_length) {
+            camera.params[0] = ip[0];  // f
+          }
+          if (options_.refine_extra_params) {
+            if (camera.model_id == CameraModelId::kSimpleRadial) {
+              camera.params[3] = ip[1];  // k1
+            } else {  // Radial
+              camera.params[3] = ip[1];  // k1
+              camera.params[4] = ip[2];  // k2
+            }
+          }
+        }
+      }
+
+      // Write optimized 3D points back to Reconstruction.
+      for (const auto& [point3D_id, idx] : point3D_id_to_idx_) {
+        if (constant_point_mask_[idx]) continue;
+        auto& point3D = reconstruction_.Point3D(point3D_id);
+        point3D.xyz.x() = points_3d_[idx * 3 + 0];
+        point3D.xyz.y() = points_3d_[idx * 3 + 1];
+        point3D.xyz.z() = points_3d_[idx * 3 + 2];
+      }
     } catch (py::error_already_set& e) {
       LOG(ERROR) << "BAE Python error: " << e.what();
       return summary;
@@ -225,26 +274,34 @@ class BaeBundleAdjuster : public BundleAdjuster {
 
   // Extracted flat arrays for Python BAE solver.
   size_t num_images_ = 0;
+  size_t num_cameras_ = 0;
   size_t num_points_ = 0;
   size_t num_observations_ = 0;
 
   std::unordered_map<image_t, size_t> image_id_to_idx_;
+  std::unordered_map<camera_t, size_t> camera_id_to_idx_;
   std::unordered_map<point3D_t, size_t> point3D_id_to_idx_;
 
-  // (num_images_ * 10): [tx,ty,tz, qx,qy,qz,qw, f, k1, k2] per image.
-  std::vector<double> camera_params_;
+  // (num_images_ * 7): [tx,ty,tz, qx,qy,qz,qw] per image.
+  std::vector<double> extrinsics_;
+  // (num_cameras_ * 3): [f, k1, k2] per unique camera.
+  std::vector<double> intrinsics_;
   // (num_points_ * 3): [x, y, z] per point.
   std::vector<double> points_3d_;
   // (num_observations_ * 2): centered 2D observations.
   std::vector<double> points_2d_;
-  // (num_observations_): camera (image) index per observation.
-  std::vector<int> camera_indices_;
+  // (num_observations_): image index per observation (for extrinsics).
+  std::vector<int> image_indices_;
+  // (num_observations_): camera index per observation (for intrinsics).
+  std::vector<int> camera_obs_indices_;
   // (num_observations_): point index per observation.
   std::vector<int> point_indices_;
   // (num_images_): 1 if camera pose is constant.
-  std::vector<uint8_t> constant_camera_mask_;
+  std::vector<uint8_t> constant_pose_mask_;
   // (num_points_): 1 if 3D point is constant.
   std::vector<uint8_t> constant_point_mask_;
+  // (num_images_): camera index for each image (for intrinsics lookup).
+  std::vector<int> image_camera_idx_;
   // (num_images_): camera_id for each image (for intrinsics writeback).
   std::vector<camera_t> image_camera_ids_;
 };
@@ -262,9 +319,14 @@ void BaeBundleAdjuster::SetupProblem() {
         << "BAE does not support multi-sensor rigs";
   }
 
-  // Build image_id -> contiguous index map for config images.
+  // Build image_id -> contiguous index map and camera_id -> index map.
   for (const image_t image_id : config_.Images()) {
     image_id_to_idx_[image_id] = num_images_++;
+    const auto& image = reconstruction_.Image(image_id);
+    camera_t cam_id = image.CameraId();
+    if (camera_id_to_idx_.count(cam_id) == 0) {
+      camera_id_to_idx_[cam_id] = num_cameras_++;
+    }
   }
 
   // Collect point3D_ids observed in config images
@@ -289,10 +351,8 @@ void BaeBundleAdjuster::SetupProblem() {
     }
   }
 
-  // Append the extra points from config's VariablePoints and ConstantPoints that are not
-  // already included above from the config images.
-  // This is crucial when using incremental_mapper
-  // For global_mapper, they may be empty
+  // Append the extra points from config's VariablePoints and ConstantPoints
+  // that are not already included above from the config images.
   auto collect_extra_point = [&](const point3D_t point3D_id) {
     if (config_.IsIgnoredPoint(point3D_id)) return;
     const auto& point3D = reconstruction_.Point3D(point3D_id);
@@ -305,8 +365,6 @@ void BaeBundleAdjuster::SetupProblem() {
       point3D_id_to_idx_[point3D_id] = num_points_++;
     }
   };
-  // Scan through the variable and constant points in the config
-  // and add them
   for (const auto point3D_id : config_.VariablePoints()) {
     collect_extra_point(point3D_id);
   }
@@ -314,10 +372,11 @@ void BaeBundleAdjuster::SetupProblem() {
     collect_extra_point(point3D_id);
   }
 
-  // Extract camera_params (pose + intrinsics) for config images.
-  // Initialize placeholders
-  camera_params_.resize(num_images_ * 10);
-  constant_camera_mask_.resize(num_images_, 0);
+  // Extract extrinsics (per-image) and intrinsics (per-camera).
+  extrinsics_.resize(num_images_ * 7);
+  intrinsics_.resize(num_cameras_ * 3);
+  constant_pose_mask_.resize(num_images_, 0);
+  image_camera_idx_.resize(num_images_);
   image_camera_ids_.resize(num_images_);
 
   for (const image_t image_id : config_.Images()) {
@@ -327,8 +386,8 @@ void BaeBundleAdjuster::SetupProblem() {
     const Rigid3d& rig_from_world =
         reconstruction_.Frame(image.FrameId()).RigFromWorld();
 
-    double* p = &camera_params_[idx * 10];
-    // Reorder: COLMAP [qx,qy,qz,qw,tx,ty,tz] -> BAE [tx,ty,tz,qx,qy,qz,qw].
+    // Extrinsics: [tx,ty,tz, qx,qy,qz,qw] per image.
+    double* p = &extrinsics_[idx * 7];
     const auto q = rig_from_world.rotation();
     const auto t = rig_from_world.translation();
     p[0] = t.x();
@@ -338,26 +397,31 @@ void BaeBundleAdjuster::SetupProblem() {
     p[4] = q.y();
     p[5] = q.z();
     p[6] = q.w();
-    // Intrinsics: f, k1, k2.
-    p[7] = camera.params[0];
+
+    // Map image -> camera index.
+    const size_t cam_idx = camera_id_to_idx_.at(image.CameraId());
+    image_camera_idx_[idx] = static_cast<int>(cam_idx);
+    image_camera_ids_[idx] = image.CameraId();
+
+    // Intrinsics: [f, k1, k2] per unique camera (written once per camera).
+    double* ip = &intrinsics_[cam_idx * 3];
+    ip[0] = camera.params[0];
     if (camera.model_id == CameraModelId::kSimpleRadial) {
-      p[8] = camera.params[3]; // k1
-      p[9] = 0.0; // For simple radial, k2 = 0
+      ip[1] = camera.params[3]; // k1
+      ip[2] = 0.0;
     } else {  // Radial
-      p[8] = camera.params[3];
-      p[9] = camera.params[4];
+      ip[1] = camera.params[3];
+      ip[2] = camera.params[4];
     }
 
-    constant_camera_mask_[idx] =
+    constant_pose_mask_[idx] =
         !options_.refine_rig_from_world ||
         config_.HasConstantRigFromWorldPose(image.FrameId());
-    image_camera_ids_[idx] = image.CameraId();
   }
 
   // Extract points_3d and constant_point_mask.
   points_3d_.resize(num_points_ * 3);
   constant_point_mask_.resize(num_points_, 0);
-  // Gather the 3D points from the point ids collected above
   for (const auto& [point3D_id, idx] : point3D_id_to_idx_) {
     const auto& point3D = reconstruction_.Point3D(point3D_id);
     points_3d_[idx * 3 + 0] = point3D.xyz.x();
@@ -367,9 +431,9 @@ void BaeBundleAdjuster::SetupProblem() {
         !options_.refine_points3D || config_.HasConstantPoint(point3D_id);
   }
 
-  // Extract observations (2D points and and their respective indices) from config images.
+  // Extract observations from config images.
   for (const image_t image_id : config_.Images()) {
-    const size_t cam_idx = image_id_to_idx_.at(image_id);
+    const size_t img_idx = image_id_to_idx_.at(image_id);
     const auto& image = reconstruction_.Image(image_id);
     const auto& camera = reconstruction_.Camera(image.CameraId());
     const double cx = camera.params[1];
@@ -383,18 +447,14 @@ void BaeBundleAdjuster::SetupProblem() {
       // Center around principal point (COLMAP convention: obs - cx).
       points_2d_.push_back(point2D.xy.x() - cx);
       points_2d_.push_back(point2D.xy.y() - cy);
-      camera_indices_.push_back(static_cast<int>(cam_idx));
+      image_indices_.push_back(static_cast<int>(img_idx));
+      camera_obs_indices_.push_back(image_camera_idx_[img_idx]);
       point_indices_.push_back(static_cast<int>(it->second));
       ++num_observations_;
     }
   }
 
-  // C4: handle VariablePoints/ConstantPoints extra residuals.
-  // This is mainly to handle cases for local BA. 
-  // Note that local BA may include only a set of neighboring images and their corresponding 2D points.
-  // But their corresponding 3D points may also be observed by images in the neighborhood set. 
-  // So, we still add these points to the optimization set but we do not optimize their
-  // camera poses because they are not in the neighborhood set. So, we freeze their camera poses.
+  // Handle VariablePoints/ConstantPoints extra residuals.
   // Add observations from external images with frozen poses.
   auto add_external_obs = [&](const point3D_t point3D_id) {
     auto pt_it = point3D_id_to_idx_.find(point3D_id);
@@ -411,17 +471,34 @@ void BaeBundleAdjuster::SetupProblem() {
           ext_camera.model_id != CameraModelId::kRadial) {
         continue;
       }
+
       // Add external image as frozen camera if not yet added.
-      size_t ext_cam_idx;
+      size_t ext_img_idx;
       auto img_it = image_id_to_idx_.find(track_el.image_id);
       if (img_it == image_id_to_idx_.end()) {
-        ext_cam_idx = num_images_++;
-        image_id_to_idx_[track_el.image_id] = ext_cam_idx;
-        camera_params_.resize(num_images_ * 10);
-        constant_camera_mask_.push_back(1);
-        image_camera_ids_.push_back(ext_image.CameraId());
+        ext_img_idx = num_images_++;
+        image_id_to_idx_[track_el.image_id] = ext_img_idx;
+
+        // Add camera if new.
+        camera_t ext_cam_id = ext_image.CameraId();
+        if (camera_id_to_idx_.count(ext_cam_id) == 0) {
+          camera_id_to_idx_[ext_cam_id] = num_cameras_++;
+          intrinsics_.resize(num_cameras_ * 3);
+          double* ip = &intrinsics_[(num_cameras_ - 1) * 3];
+          ip[0] = ext_camera.params[0];
+          if (ext_camera.model_id == CameraModelId::kSimpleRadial) {
+            ip[1] = ext_camera.params[3];
+            ip[2] = 0.0;
+          } else {
+            ip[1] = ext_camera.params[3];
+            ip[2] = ext_camera.params[4];
+          }
+        }
+
+        // Extrinsics for external image.
+        extrinsics_.resize(num_images_ * 7);
         const Rigid3d cam_from_world = ext_image.CamFromWorld();
-        double* ep = &camera_params_[ext_cam_idx * 10];
+        double* ep = &extrinsics_[ext_img_idx * 7];
         const auto eq = cam_from_world.rotation();
         const auto et = cam_from_world.translation();
         ep[0] = et.x();
@@ -431,23 +508,22 @@ void BaeBundleAdjuster::SetupProblem() {
         ep[4] = eq.y();
         ep[5] = eq.z();
         ep[6] = eq.w();
-        ep[7] = ext_camera.params[0];
-        if (ext_camera.model_id == CameraModelId::kSimpleRadial) {
-          ep[8] = ext_camera.params[3];
-          ep[9] = 0.0;
-        } else {
-          ep[8] = ext_camera.params[3];
-          ep[9] = ext_camera.params[4];
-        }
+
+        constant_pose_mask_.push_back(1);  // External images are frozen.
+        image_camera_idx_.push_back(
+            static_cast<int>(camera_id_to_idx_.at(ext_cam_id)));
+        image_camera_ids_.push_back(ext_cam_id);
       } else {
-        ext_cam_idx = img_it->second;
+        ext_img_idx = img_it->second;
       }
+
       const double cx = ext_camera.params[1];
       const double cy = ext_camera.params[2];
       const auto& ext_pt2D = ext_image.Point2D(track_el.point2D_idx);
       points_2d_.push_back(ext_pt2D.xy.x() - cx);
       points_2d_.push_back(ext_pt2D.xy.y() - cy);
-      camera_indices_.push_back(static_cast<int>(ext_cam_idx));
+      image_indices_.push_back(static_cast<int>(ext_img_idx));
+      camera_obs_indices_.push_back(image_camera_idx_[ext_img_idx]);
       point_indices_.push_back(static_cast<int>(pt_it->second));
       ++num_observations_;
     }
@@ -460,6 +536,7 @@ void BaeBundleAdjuster::SetupProblem() {
   }
 
   LOG(INFO) << "BAE extraction: " << num_images_ << " images, "
+            << num_cameras_ << " cameras, "
             << num_points_ << " points, " << num_observations_
             << " observations";
 }

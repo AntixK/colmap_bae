@@ -284,7 +284,7 @@ def solve(
         strat = pp.optim.strategy.TrustRegion(
             radius=1e4, max=1e10, up=2.0, down=0.5**4)
         slvr = PCG(tol=1e-5)
-        hub = Huber(1.0)  # matching InstantSFM's thres_loss_function
+        hub = Huber(1.0)  # matching InstantSFM exactly
         opt = LM(mdl, strategy=strat, solver=slvr, kernel=hub, reject=30)
         return mdl, opt, inp, (ig_n2o, cm_n2o, pt_n2o)
 
@@ -320,7 +320,8 @@ def solve(
     #       FilterTracksByReprojectionNormalized(
     #           ..., max_reproj_error * max(1, 3 - iter))
     #
-    # We use decreasing pixel thresholds: 100 → 50 → 20 px.
+    # Decreasing thresholds: optimise then filter, progressively
+    # cleaning the data.
     # ------------------------------------------------------------------
     filter_thresholds = [100.0, 50.0, 20.0]
     total_iterations = 0

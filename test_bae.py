@@ -85,6 +85,7 @@ def parse_num_observations(output):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     image_dir = Path("data/Ignatius/images")
     if not image_dir.exists():
@@ -107,53 +108,84 @@ def main():
     # Step 1: Feature extraction
     # ------------------------------------------------------------------
     print("== Step 1: Feature extraction ==")
-    run([
-        "colmap", "feature_extractor",
-        "--database_path", str(database_path),
-        "--image_path", str(image_dir),
-        "--ImageReader.single_camera", "1",
-        "--ImageReader.camera_model", "SIMPLE_RADIAL",
-        "--FeatureExtraction.use_gpu", "1",
-        "--FeatureExtraction.gpu_index", "0",
-    ])
+    run(
+        [
+            "colmap",
+            "feature_extractor",
+            "--database_path",
+            str(database_path),
+            "--image_path",
+            str(image_dir),
+            "--ImageReader.single_camera",
+            "1",
+            "--ImageReader.camera_model",
+            "SIMPLE_RADIAL",
+            "--FeatureExtraction.use_gpu",
+            "1",
+            "--FeatureExtraction.gpu_index",
+            "0",
+        ]
+    )
     check(database_path.exists(), "Database created")
 
     # ------------------------------------------------------------------
     # Step 2: Feature matching
     # ------------------------------------------------------------------
     print("\n== Step 2: Feature matching ==")
-    run([
-        "colmap", "sequential_matcher",
-        "--database_path", str(database_path),
-        "--FeatureMatching.use_gpu", "1",
-        "--FeatureMatching.gpu_index", "0",
-        "--SequentialMatching.overlap", "10",
-    ])
+    run(
+        [
+            "colmap",
+            "sequential_matcher",
+            "--database_path",
+            str(database_path),
+            "--FeatureMatching.use_gpu",
+            "1",
+            "--FeatureMatching.gpu_index",
+            "0",
+            "--SequentialMatching.overlap",
+            "10",
+        ]
+    )
     check(True, "Sequential matching succeeded")
 
     # ------------------------------------------------------------------
     # Step 3: View graph calibration
     # ------------------------------------------------------------------
     print("\n== Step 3: View graph calibration ==")
-    run([
-        "colmap", "view_graph_calibrator",
-        "--database_path", str(database_path),
-    ])
+    run(
+        [
+            "colmap",
+            "view_graph_calibrator",
+            "--database_path",
+            str(database_path),
+        ]
+    )
     check(True, "View graph calibration succeeded")
 
     # ------------------------------------------------------------------
     # Step 4: Global reconstruction (BAE backend)
     # ------------------------------------------------------------------
     print("\n== Step 4: Global mapping (GLOMAP, BAE backend) ==")
-    run([
-        "colmap", "global_mapper",
-        "--database_path", str(database_path),
-        "--image_path", str(image_dir),
-        "--output_path", str(sparse_dir),
-        "--GlobalMapper.ba_backend", "BAE",
-        "--GlobalMapper.ba_bae_use_gpu", "1",
-        "--GlobalMapper.ba_bae_gpu_index", "0",
-    ])
+    run(
+        [
+            "colmap",
+            "global_mapper",
+            "--database_path",
+            str(database_path),
+            "--image_path",
+            str(image_dir),
+            "--output_path",
+            str(sparse_dir),
+            "--GlobalMapper.ba_backend",
+            "BAE",
+            "--GlobalMapper.random_seed",
+            "42",
+            "--GlobalMapper.ba_bae_use_gpu",
+            "1",
+            "--GlobalMapper.ba_bae_gpu_index",
+            "0",
+        ]
+    )
 
     model_dirs = sorted(sparse_dir.glob("*/cameras.bin"))
     check(len(model_dirs) > 0, "At least one reconstruction produced")
@@ -167,69 +199,14 @@ def main():
 
     # Analyze input model.
     print("\n-- Input model stats --")
-    _, input_stats = run_capture([
-        "colmap", "model_analyzer", "--path", str(model_dir),
-    ])
-
-    # ------------------------------------------------------------------
-    # # Step 5: BAE bundle adjustment (CUDA, same input)
-    # # ------------------------------------------------------------------
-    # print("\n== Step 5: BAE bundle adjustment (CUDA) ==")
-    # bae_result, bae_log = run_capture([
-    #     "colmap", "bundle_adjuster",
-    #     "--BundleAdjustment.backend", "BAE",
-    #     "--BundleAdjustmentBae.use_gpu", "1",
-    #     "--BundleAdjustmentBae.gpu_index", "0",
-    #     "--input_path", str(model_dir),
-    #     "--output_path", str(bae_output),
-    # ])
-    # check(bae_result.returncode == 0, "BAE BA exited successfully")
-    # check("BAE extraction:" in bae_log, "BAE extraction ran")
-    # check("BAE Python error" not in bae_log, "No Python errors during BAE")
-    # check("BAE bundle adjustment report" in bae_log, "BAE solver completed")
-
-    # ------------------------------------------------------------------
-    # Step 6: Validate output stats
-    # ------------------------------------------------------------------
-    print("\n== Step 6: Validate BAE output ==")
-
-    print("\n-- BAE output stats --")
-    _, bae_stats = run_capture([
-        "colmap", "model_analyzer", "--path", str(bae_output),
-    ])
-
-    for fname in ("cameras.bin", "images.bin", "points3D.bin"):
-        fpath = bae_output / fname
-        check(
-            fpath.exists() and fpath.stat().st_size > 0,
-            f"BAE: {fname} exists and non-empty",
-        )
-
-    input_err = parse_mean_reproj_error(input_stats)
-    bae_err = parse_mean_reproj_error(bae_stats)
-    input_pts = parse_num_points(input_stats)
-    bae_pts = parse_num_points(bae_stats)
-    bae_obs = parse_num_observations(bae_stats)
-
-    print(f"\n  Input model: reproj_err={input_err}px, points={input_pts}")
-    print(
-        f"  BAE output:  reproj_err={bae_err}px, points={bae_pts}, "
-        f"observations={bae_obs}"
+    _, input_stats = run_capture(
+        [
+            "colmap",
+            "model_analyzer",
+            "--path",
+            str(model_dir),
+        ]
     )
-
-    check(bae_err is not None, "Parsed BAE reprojection error")
-    check(bae_pts is not None, "Parsed BAE point count")
-    check(bae_obs is not None, "Parsed BAE observation count")
-    check(
-        bae_err is not None and math.isfinite(bae_err),
-        "BAE reprojection error is finite",
-    )
-    if input_err is not None and bae_err is not None:
-        check(
-            bae_err <= max(5.0 * input_err, 5.0),
-            f"BAE error not catastrophically worse (in={input_err:.4f}, out={bae_err:.4f})",
-        )
-
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------

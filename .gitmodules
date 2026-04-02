@@ -1,0 +1,3 @@
+[submodule "InstantSfM"]
+	path = InstantSfM
+	url = https://github.com/cre185/InstantSfM.git

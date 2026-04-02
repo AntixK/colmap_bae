@@ -5,6 +5,7 @@
 #include "colmap/util/timer.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -61,6 +62,13 @@ class BaeBundleAdjuster : public BundleAdjuster {
     summary->termination_type = BundleAdjustmentTerminationType::FAILURE;
     summary->num_residuals = static_cast<int>(num_observations_ * 2);
 
+    // Nothing to optimize.
+    if (num_observations_ == 0 || num_images_ == 0) {
+      summary->termination_type =
+          BundleAdjustmentTerminationType::NO_CONVERGENCE;
+      return summary;
+    }
+
     // C1: Ensure Python interpreter is available.
     // CLI mode: no interpreter running -> initialize once, release GIL.
     // pycolmap mode: interpreter already running -> skip initialization.
@@ -85,13 +93,21 @@ class BaeBundleAdjuster : public BundleAdjuster {
       // InitGoogleLogging, fatal when glog is already initialized by CLI).
       //
       // Search order:
+      //  0. Environment override COLMAP_BAE_SOLVER_PATH (exact file path).
       //  1. Compile-time source tree path (development builds).
       //  2. Locate the installed pycolmap package directory on sys.path
       //     using find_spec (does NOT execute __init__.py).
       std::string solver_path;
+      if (const char* env_solver_path =
+              std::getenv("COLMAP_BAE_SOLVER_PATH");
+          env_solver_path != nullptr && std::strlen(env_solver_path) > 0) {
+        solver_path = env_solver_path;
+      }
 #ifdef BAE_SOLVER_MODULE_DIR
-      solver_path =
-          std::string(BAE_SOLVER_MODULE_DIR) + "/pycolmap/bae_solver.py";
+      if (solver_path.empty()) {
+        solver_path =
+            std::string(BAE_SOLVER_MODULE_DIR) + "/pycolmap/bae_solver.py";
+      }
 #endif
       if (solver_path.empty() || !std::filesystem::exists(solver_path)) {
         // find_spec locates the package without importing it.
@@ -146,11 +162,17 @@ class BaeBundleAdjuster : public BundleAdjuster {
       if (options_.bae) {
         options_dict["max_num_iterations"] =
             options_.bae->max_num_iterations;
-        options_dict["use_gpu"] = options_.bae->use_gpu;
+        if (!options_.bae->use_gpu) {
+          LOG(WARNING) << "BAE backend is CUDA-only. Forcing "
+                          "BundleAdjustmentBae.use_gpu=true.";
+        }
+        options_dict["use_gpu"] = true;
         options_dict["gpu_index"] = options_.bae->gpu_index;
       }
       options_dict["refine_focal_length"] = options_.refine_focal_length;
       options_dict["refine_extra_params"] = options_.refine_extra_params;
+      options_dict["constant_rig_from_world_rotation"] =
+          options_.constant_rig_from_world_rotation;
 
       // Call the Python BAE solver.
       py::dict result = bae_solver.attr("solve")(extr_arr,
@@ -190,6 +212,7 @@ class BaeBundleAdjuster : public BundleAdjuster {
       // Write optimized extrinsics back to Reconstruction.
       for (const auto& [image_id, idx] : image_id_to_idx_) {
         if (constant_pose_mask_[idx]) continue;
+        if (!reconstruction_.ExistsImage(image_id)) continue;
         const double* p = &extrinsics_[idx * 7];
         Eigen::Quaterniond q(p[6], p[3], p[4], p[5]);  // qw, qx, qy, qz
         Eigen::Vector3d t(p[0], p[1], p[2]);
@@ -201,6 +224,7 @@ class BaeBundleAdjuster : public BundleAdjuster {
       // Write optimized intrinsics back to Reconstruction.
       if (options_.refine_focal_length || options_.refine_extra_params) {
         for (const auto& [cam_id, cidx] : camera_id_to_idx_) {
+          if (!reconstruction_.ExistsCamera(cam_id)) continue;
           const double* ip = &intrinsics_[cidx * 3];
           auto& camera = reconstruction_.Camera(cam_id);
           if (options_.refine_focal_length) {
@@ -220,6 +244,7 @@ class BaeBundleAdjuster : public BundleAdjuster {
       // Write optimized 3D points back to Reconstruction.
       for (const auto& [point3D_id, idx] : point3D_id_to_idx_) {
         if (constant_point_mask_[idx]) continue;
+        if (!reconstruction_.ExistsPoint3D(point3D_id)) continue;
         auto& point3D = reconstruction_.Point3D(point3D_id);
         point3D.xyz.x() = points_3d_[idx * 3 + 0];
         point3D.xyz.y() = points_3d_[idx * 3 + 1];
@@ -311,6 +336,7 @@ void BaeBundleAdjuster::SetupProblem() {
   // Validate: all cameras use SimpleRadial or Radial
   // Currently BAE does not support multiRig camera setups
   for (const image_t image_id : config_.Images()) {
+    if (!reconstruction_.ExistsImage(image_id)) continue;
     const auto& image = reconstruction_.Image(image_id);
     const auto& camera = reconstruction_.Camera(image.CameraId());
     THROW_CHECK(camera.model_id == CameraModelId::kSimpleRadial ||
@@ -326,10 +352,12 @@ void BaeBundleAdjuster::SetupProblem() {
   // trigger sparse-solver bugs in BAE.
   std::unordered_set<image_t> images_with_obs;
   for (const image_t image_id : config_.Images()) {
+    if (!reconstruction_.ExistsImage(image_id)) continue;
     const auto& image = reconstruction_.Image(image_id);
     for (const auto& point2D : image.Points2D()) {
       if (!point2D.HasPoint3D()) continue;
       if (config_.IsIgnoredPoint(point2D.point3D_id)) continue;
+      if (!reconstruction_.ExistsPoint3D(point2D.point3D_id)) continue;
       const auto& point3D = reconstruction_.Point3D(point2D.point3D_id);
       if (options_.min_track_length > 0 &&
           static_cast<int>(point3D.track.Length()) <
@@ -359,6 +387,7 @@ void BaeBundleAdjuster::SetupProblem() {
   // that are not already included above from the config images.
   auto collect_extra_point = [&](const point3D_t point3D_id) {
     if (config_.IsIgnoredPoint(point3D_id)) return;
+    if (!reconstruction_.ExistsPoint3D(point3D_id)) return;
     const auto& point3D = reconstruction_.Point3D(point3D_id);
     if (options_.min_track_length > 0 &&
         static_cast<int>(point3D.track.Length()) <
@@ -384,7 +413,9 @@ void BaeBundleAdjuster::SetupProblem() {
   image_camera_ids_.resize(num_images_);
 
   for (const image_t image_id : config_.Images()) {
-    const size_t idx = image_id_to_idx_.at(image_id);
+    auto it = image_id_to_idx_.find(image_id);
+    if (it == image_id_to_idx_.end()) continue;  // No observations for image.
+    const size_t idx = it->second;
     const auto& image = reconstruction_.Image(image_id);
     const auto& camera = reconstruction_.Camera(image.CameraId());
     const Rigid3d& rig_from_world =
@@ -427,6 +458,7 @@ void BaeBundleAdjuster::SetupProblem() {
   points_3d_.resize(num_points_ * 3);
   constant_point_mask_.resize(num_points_, 0);
   for (const auto& [point3D_id, idx] : point3D_id_to_idx_) {
+    if (!reconstruction_.ExistsPoint3D(point3D_id)) continue;
     const auto& point3D = reconstruction_.Point3D(point3D_id);
     points_3d_[idx * 3 + 0] = point3D.xyz.x();
     points_3d_[idx * 3 + 1] = point3D.xyz.y();
@@ -437,7 +469,9 @@ void BaeBundleAdjuster::SetupProblem() {
 
   // Extract observations from config images.
   for (const image_t image_id : config_.Images()) {
-    const size_t img_idx = image_id_to_idx_.at(image_id);
+    auto obs_it = image_id_to_idx_.find(image_id);
+    if (obs_it == image_id_to_idx_.end()) continue;  // No observations.
+    const size_t img_idx = obs_it->second;
     const auto& image = reconstruction_.Image(image_id);
     const auto& camera = reconstruction_.Camera(image.CameraId());
     const double cx = camera.params[1];
@@ -446,6 +480,7 @@ void BaeBundleAdjuster::SetupProblem() {
     for (const auto& point2D : image.Points2D()) {
       if (!point2D.HasPoint3D()) continue;
       if (config_.IsIgnoredPoint(point2D.point3D_id)) continue;
+      if (!reconstruction_.ExistsPoint3D(point2D.point3D_id)) continue;
       auto it = point3D_id_to_idx_.find(point2D.point3D_id);
       if (it == point3D_id_to_idx_.end()) continue;
       // Center around principal point (COLMAP convention: obs - cx).
@@ -463,9 +498,11 @@ void BaeBundleAdjuster::SetupProblem() {
   auto add_external_obs = [&](const point3D_t point3D_id) {
     auto pt_it = point3D_id_to_idx_.find(point3D_id);
     if (pt_it == point3D_id_to_idx_.end()) return;
+    if (!reconstruction_.ExistsPoint3D(point3D_id)) return;
     const auto& point3D = reconstruction_.Point3D(point3D_id);
     for (const auto& track_el : point3D.track.Elements()) {
       if (config_.HasImage(track_el.image_id)) continue;
+      if (!reconstruction_.ExistsImage(track_el.image_id)) continue;
       const auto& ext_image = reconstruction_.Image(track_el.image_id);
       THROW_CHECK(ext_image.IsRefInFrame())
           << "BAE does not support multi-sensor rigs (external image)";

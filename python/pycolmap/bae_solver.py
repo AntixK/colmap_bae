@@ -5,7 +5,7 @@ Follows InstantSFM's TorchBA architecture: base LM optimizer with separate
 parameter blocks and rotate_quat projection.
 """
 
-import logging
+import sys
 import numpy as np
 import pypose as pp
 import torch
@@ -15,9 +15,16 @@ from bae.autograd.function import TrackingTensor, map_transform
 from bae.optim import LM
 from bae.utils.ba import rotate_quat
 from bae.utils.pysolvers import PCG
-from pypose.optim.kernel import Huber
+from pypose.optim.kernel import Huber, Cauchy
 
-logger = logging.getLogger("colmap.bae")
+
+def _log(msg):
+    """Print a [BAE] message; flushed so it interleaves with C++ logs."""
+    print(f"[BAE] {msg}", flush=True)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def _distort_and_project(points_cam, intrinsics):
@@ -187,6 +194,43 @@ def solve(
     n_cams_orig = intrinsics_full.shape[0]
     n_pts_orig = points_full.shape[0]
 
+    # DEBUG: confirm indices arrays from C++ have correct distinct values.
+    _log(
+        "DEBUG indices: img_idx shape=%s strides=%s dtype=%s "
+        "unique=%d min=%d max=%d"
+        % (image_indices_np.shape, image_indices_np.strides,
+           image_indices_np.dtype,
+           len(np.unique(image_indices_np)),
+           int(image_indices_np.min()), int(image_indices_np.max()))
+    )
+    _log(
+        "DEBUG indices: pt_idx  shape=%s strides=%s dtype=%s "
+        "unique=%d min=%d max=%d"
+        % (point_indices_np.shape, point_indices_np.strides,
+           point_indices_np.dtype,
+           len(np.unique(point_indices_np)),
+           int(point_indices_np.min()), int(point_indices_np.max()))
+    )
+    _log(
+        "DEBUG indices: first 10 img_idx=%s  pt_idx=%s"
+        % (image_indices_np[:10].tolist(), point_indices_np[:10].tolist())
+    )
+
+    # DEBUG workaround: if strides are wrong, re-read raw buffer with
+    # explicit stride.  Will raise if the underlying memory truly is zero
+    # (i.e., the bug is not stride-related).
+    try:
+        raw = np.frombuffer(memoryview(image_indices_np).tobytes(),
+                            dtype=np.int32)
+        _log(
+            "DEBUG raw img_idx via frombuffer: len=%d unique=%d "
+            "min=%d max=%d  first10=%s"
+            % (len(raw), len(np.unique(raw)),
+               int(raw.min()), int(raw.max()), raw[:10].tolist())
+        )
+    except Exception as e:
+        _log("DEBUG frombuffer failed: %r" % e)
+
     # ------------------------------------------------------------------
     # Pre-BA outlier filtering (adapted from InstantSFM global_mapper
     # line 133: FilterTracksByAngle + FilterTracksByReprojectionNormalized).
@@ -202,7 +246,7 @@ def solve(
     point_indices_cur = point_indices_np.copy()
     points_2d_cur = points_2d_np.reshape(-1, 2).copy()
 
-    # Coarse filter on the raw data (before compact remap) using GPU.
+    # Compute initial reprojection errors on GPU.
     _ext_t = torch.tensor(extrinsics_full, dtype=torch.float64, device=device)
     _intr_t = torch.tensor(intrinsics_full, dtype=torch.float64, device=device)
     _pts3_t = torch.tensor(points_full, dtype=torch.float64, device=device)
@@ -211,26 +255,161 @@ def solve(
     _cam_idx = torch.tensor(camera_indices_cur, dtype=torch.long, device=device)
     _pt_idx = torch.tensor(point_indices_cur, dtype=torch.long, device=device)
 
-    # Use a generous initial threshold (like InstantSFM iter-0:
-    # max_reprojection_error * 3).  We use absolute pixels since our
-    # observations are already centred.
-    initial_filter_px = options_dict.get("initial_filter_px", 100.0)
-    keep = _filter_observations_by_reproj(
-        _ext_t, _intr_t, _pts3_t, _pts2_t,
-        _img_idx, _cam_idx, _pt_idx,
-        max_error=initial_filter_px,
-    )
-    keep_np = keep.cpu().numpy()
+    with torch.no_grad():
+        all_errs = _compute_reprojection_errors(
+            _ext_t, _intr_t, _pts3_t, _pts2_t,
+            _img_idx, _cam_idx, _pt_idx,
+        )
+        pts_z = pp.SE3(_ext_t[_img_idx]).Act(_pts3_t[_pt_idx])[:, 2]
+        valid = pts_z > 0
+        # Per-observation focal length (column 0 of intrinsics).  Used to
+        # convert pixel residuals to normalized image-plane units —
+        # directly comparable to COLMAP's max_normalized_reproj_error
+        # (default 1e-2 in global_mapper.h).
+        focals = _intr_t[_cam_idx, 0]
+        all_norm_np = (all_errs / focals.clamp(min=1e-8)).cpu().numpy()
+        all_errs_np = all_errs.cpu().numpy()
+        valid_np = valid.cpu().numpy()
+
+    # Log error distribution in both pixel and normalized units so we can
+    # compare against COLMAP's filter thresholds (which are normalized).
+    valid_errs = all_errs_np[valid_np]
+    valid_norm = all_norm_np[valid_np]
+    median_err_px = 1.0
+    if len(valid_errs) > 0:
+        pcts = np.percentile(valid_errs, [10, 25, 50, 75, 90, 95, 99])
+        npcts = np.percentile(valid_norm, [10, 25, 50, 75, 90, 95, 99])
+        median_err_px = float(pcts[2])
+        _log(
+            "init err [px]   p10=%.2f p25=%.2f p50=%.2f p75=%.2f "
+            "p90=%.2f p95=%.2f p99=%.2f  behind_cam=%d  n=%d"
+            % (*pcts, int((~valid_np).sum()), len(valid_errs))
+        )
+        _log(
+            "init err [norm] p10=%.2e p25=%.2e p50=%.2e p75=%.2e "
+            "p90=%.2e p95=%.2e p99=%.2e  (colmap_filter=%.2e)"
+            % (*npcts, 1e-2)
+        )
+
+    # Robust kernel scale (#1): Huber transition at 2 * median pixel
+    # residual.  With a bad initialization (median ~500 px) Huber(1.0)
+    # puts every observation in the linear regime, so all gradients become
+    # constant-magnitude and the LM step direction is dominated by sign
+    # noise rather than residual structure.  Scaling the kernel to the
+    # actual residual distribution keeps inliers in the quadratic regime.
+    kernel_delta = max(2.0 * median_err_px, 1.0)
+    _log("kernel: Huber(delta=%.2f px)" % kernel_delta)
+
+    # Pre-filter in NORMALIZED image-plane units (residual / focal).
+    # Matches COLMAP's filter convention (max_normalized_reproj_error,
+    # default 1e-2 in global_mapper.h, applied at {3,2,1}*1e-2 across the
+    # 3 outer BA rounds).  0.10 is 10x COLMAP's iter-0 cutoff: generous
+    # enough to retain the inlier core, tight enough to reject gross
+    # outliers regardless of camera focal length.
+    keep_mask = valid_np & (all_norm_np < 0.10)
+
     n_before = len(image_indices_cur)
-    image_indices_cur = image_indices_cur[keep_np]
-    camera_indices_cur = camera_indices_cur[keep_np]
-    point_indices_cur = point_indices_cur[keep_np]
-    points_2d_cur = points_2d_cur[keep_np]
-    logger.info(
-        "BAE pre-filter: kept %d / %d observations (threshold %.1f px)",
-        len(image_indices_cur), n_before, initial_filter_px,
+    image_indices_cur = image_indices_cur[keep_mask]
+    camera_indices_cur = camera_indices_cur[keep_mask]
+    point_indices_cur = point_indices_cur[keep_mask]
+    points_2d_cur = points_2d_cur[keep_mask]
+    _log(
+        "pre-filter: kept %d / %d observations (threshold 1.00e-01 norm)"
+        % (len(image_indices_cur), n_before)
     )
+
+    # Track-length distribution log (post norm-filter).  Useful for tuning
+    # any future min-track filter — sequential matching with overlap=N
+    # produces tracks of length 5..N+ typically; isolated short tracks
+    # (length 2) survive only when matching gaps are large.
+    counts_np = np.bincount(point_indices_cur, minlength=n_pts_orig)
+    present_lengths = counts_np[counts_np > 0]
+    if len(present_lengths) > 0:
+        lpcts = np.percentile(present_lengths, [10, 25, 50, 75, 90, 95, 99])
+        _log(
+            "track lengths: p10=%d p25=%d p50=%d p75=%d p90=%d p95=%d "
+            "p99=%d  n_tracks=%d"
+            % (*lpcts.astype(int), len(present_lengths))
+        )
+
+    # Triangulation-angle filter (#A): drop observations whose track has
+    # near-degenerate parallax.  A track with all rays within a tight cone
+    # is poorly conditioned: tiny perturbations of the 3D point change
+    # depth dramatically without changing the projected residual, so BA
+    # can't find a descent direction.  These are the observations that
+    # survive a residual filter (small residual) but pin BA at a
+    # high-residual plateau (~6e-2 norm in our case).
+    #
+    # We compute, per point, the maximum angle between any of its rays
+    # and the mean ray (a fast O(N_obs) proxy for max pairwise angle —
+    # max-pairwise is bounded by 2x max-from-mean, so this is at worst
+    # 2x stricter than the true pairwise threshold).  COLMAP's
+    # incremental mapper uses a 1.5deg minimum (incremental_mapper.h:126).
+    TRI_ANGLE_DEG = 1.5
+    cos_thresh = float(np.cos(np.radians(TRI_ANGLE_DEG)))
+
+    img_idx_t = torch.tensor(image_indices_cur, dtype=torch.long, device=device)
+    pt_idx_t = torch.tensor(point_indices_cur, dtype=torch.long, device=device)
+    ext_t = torch.tensor(extrinsics_full, dtype=torch.float64, device=device)
+    pts3_t = torch.tensor(points_full, dtype=torch.float64, device=device)
+
+    # Camera centers in world frame.  Existing convention: pp.SO3(q).Act(p)
+    # rotates world -> cam, then + t gives cam-frame point (lines 51-52,
+    # 92-98).  Therefore cam_center_world = -SO3(q).Inv().Act(t).
+    quats = ext_t[:, 3:7]
+    trans = ext_t[:, :3]
+    cam_centers = -pp.SO3(quats).Inv().Act(trans)
+
+    # Per-obs unit ray from camera center to 3D point in world frame.
+    rays = pts3_t[pt_idx_t] - cam_centers[img_idx_t]
+    rays_unit = rays / rays.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    # Per-point mean ray (sum of unit rays, then normalize).
+    sum_ray = torch.zeros(n_pts_orig, 3, dtype=torch.float64, device=device)
+    sum_ray.scatter_add_(
+        0, pt_idx_t.unsqueeze(-1).expand(-1, 3), rays_unit)
+    mean_ray = sum_ray / sum_ray.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    # Per-obs dot to its track's mean ray.  Per-point min dot = max angle
+    # from mean.  Initialize to >1 sentinel so empty tracks don't pass.
+    dots = (rays_unit * mean_ray[pt_idx_t]).sum(dim=-1)
+    min_dot_per_pt = torch.full(
+        (n_pts_orig,), 1.0 + 1e-9, dtype=torch.float64, device=device)
+    min_dot_per_pt.scatter_reduce_(0, pt_idx_t, dots, reduce="amin")
+
+    # Log angle distribution (only over points present in our obs set).
+    present_mask = torch.zeros(n_pts_orig, dtype=torch.bool, device=device)
+    present_mask[pt_idx_t] = True
+    min_angles_deg = torch.rad2deg(
+        torch.arccos(min_dot_per_pt.clamp(-1.0, 1.0)))
+    present_angles = min_angles_deg[present_mask].cpu().numpy()
+    if len(present_angles) > 0:
+        apcts = np.percentile(
+            present_angles, [10, 25, 50, 75, 90, 95, 99])
+        _log(
+            "track angle [deg]: p10=%.2f p25=%.2f p50=%.2f p75=%.2f "
+            "p90=%.2f p95=%.2f p99=%.2f"
+            % tuple(apcts)
+        )
+
+    # Drop obs whose point is inside the degenerate cone.
+    track_keep_pt = (min_dot_per_pt < cos_thresh).cpu().numpy()
+    obs_keep = track_keep_pt[point_indices_cur]
+    n_before_tri = len(image_indices_cur)
+    image_indices_cur = image_indices_cur[obs_keep]
+    camera_indices_cur = camera_indices_cur[obs_keep]
+    point_indices_cur = point_indices_cur[obs_keep]
+    points_2d_cur = points_2d_cur[obs_keep]
+    _log(
+        "tri-angle filter: kept %d / %d observations "
+        "(max-from-mean >= %.1f deg)"
+        % (len(image_indices_cur), n_before_tri, TRI_ANGLE_DEG)
+    )
+
     del _ext_t, _intr_t, _pts3_t, _pts2_t, _img_idx, _cam_idx, _pt_idx
+    del img_idx_t, pt_idx_t, ext_t, pts3_t, cam_centers
+    del rays, rays_unit, sum_ray, mean_ray, dots, min_dot_per_pt
+    del min_angles_deg, present_mask
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -252,9 +431,9 @@ def solve(
         pi = pt_o2n[pt_idx_np]
 
         n_i, n_c, n_p, n_o = len(ig_n2o), len(cm_n2o), len(pt_n2o), len(ii)
-        logger.info(
-            "BAE problem: %d imgs, %d cams, %d pts, %d obs, const_rot=%s",
-            n_i, n_c, n_p, n_o, constant_rotation,
+        _log(
+            "problem: %d imgs, %d cams, %d pts, %d obs, const_rot=%s"
+            % (n_i, n_c, n_p, n_o, constant_rotation)
         )
         if n_o == 0:
             return None, None, None, (ig_n2o, cm_n2o, pt_n2o)
@@ -284,8 +463,8 @@ def solve(
         strat = pp.optim.strategy.TrustRegion(
             radius=1e4, max=1e10, up=2.0, down=0.5**4)
         slvr = PCG(tol=1e-5)
-        hub = Huber(1.0)  # matching InstantSFM exactly
-        opt = LM(mdl, strategy=strat, solver=slvr, kernel=hub, reject=30)
+        kernel = Huber(delta=kernel_delta)
+        opt = LM(mdl, strategy=strat, solver=slvr, kernel=kernel, reject=30)
         return mdl, opt, inp, (ig_n2o, cm_n2o, pt_n2o)
 
     # ------------------------------------------------------------------
@@ -300,7 +479,7 @@ def solve(
             loss = opt.step(inp)
             n_it += 1
             loss_hist.append(loss.item())
-            logger.info("BAE iter %3d  cost=%.6f", n_it, loss_hist[-1])
+            _log("iter %3d  cost=%.6f" % (n_it, loss_hist[-1]))
             if len(loss_hist) >= 2 * window_size:
                 avg_r = sum(loss_hist[-window_size:]) / window_size
                 avg_p = sum(
@@ -320,80 +499,89 @@ def solve(
     #       FilterTracksByReprojectionNormalized(
     #           ..., max_reproj_error * max(1, 3 - iter))
     #
-    # Decreasing thresholds: optimise then filter, progressively
-    # cleaning the data.
+    # Single BA round on the pre-filtered data.  COLMAP's outer loop
+    # already handles iterative filter→re-optimise (3 iterations with
+    # decreasing thresholds), so we don't duplicate that here.
     # ------------------------------------------------------------------
-    filter_thresholds = [100.0, 50.0, 20.0]
-    total_iterations = 0
-    initial_cost = None
-
-    for rnd, thresh in enumerate(filter_thresholds):
-        model, optimizer, input_data, remap = _build_problem(
-            image_indices_cur, camera_indices_cur,
-            point_indices_cur, points_2d_cur,
-        )
-        if model is None:
-            logger.info("BAE round %d: no observations, skipping.", rnd)
-            break
-
-        cost0 = model.loss(input_data, None).item()
-        if initial_cost is None:
-            initial_cost = cost0
-        logger.info("BAE round %d: initial cost=%.6f", rnd, cost0)
-
-        n_it, loss_hist = _run_ba(model, optimizer, input_data, max_iterations)
-        total_iterations += n_it
-
-        # Write optimised params back into the full-size numpy arrays
-        # so the next round (and the C++ caller) sees them.
-        ig_n2o, cm_n2o, pt_n2o = remap
-        if constant_rotation:
-            extrinsics_full[ig_n2o, :3] = (
-                model.translations.data.cpu().numpy())
-        else:
-            extrinsics_full[ig_n2o] = model.extrinsics.data.cpu().numpy()
-        intrinsics_full[cm_n2o] = model.intrinsics.data.cpu().numpy()
-        points_full[pt_n2o] = model.points_3d.data.cpu().numpy()
-
-        # Filter observations by reprojection error for the next round
-        # (adapted from InstantSFM FilterTracksByReprojectionNormalized).
-        ext_t = torch.tensor(extrinsics_full, dtype=torch.float64, device=device)
-        intr_t = torch.tensor(intrinsics_full, dtype=torch.float64, device=device)
-        p3_t = torch.tensor(points_full, dtype=torch.float64, device=device)
-        p2_t = torch.tensor(points_2d_cur, dtype=torch.float64, device=device)
-        ii_t = torch.tensor(image_indices_cur, dtype=torch.long, device=device)
-        ci_t = torch.tensor(camera_indices_cur, dtype=torch.long, device=device)
-        pi_t = torch.tensor(point_indices_cur, dtype=torch.long, device=device)
-
-        keep = _filter_observations_by_reproj(
-            ext_t, intr_t, p3_t, p2_t, ii_t, ci_t, pi_t,
-            max_error=thresh,
-        )
-        keep_np = keep.cpu().numpy()
-        n_before = len(image_indices_cur)
-        image_indices_cur = image_indices_cur[keep_np]
-        camera_indices_cur = camera_indices_cur[keep_np]
-        point_indices_cur = point_indices_cur[keep_np]
-        points_2d_cur = points_2d_cur[keep_np]
-        logger.info(
-            "BAE round %d filter: kept %d / %d obs (threshold %.1f px)",
-            rnd, len(image_indices_cur), n_before, thresh,
-        )
-        del ext_t, intr_t, p3_t, p2_t, ii_t, ci_t, pi_t
-        torch.cuda.empty_cache()
-
-    final_cost = loss_hist[-1] if loss_hist else (initial_cost or 0.0)
-    logger.info(
-        "BAE finished: %d total iters, cost %.6f -> %.6f",
-        total_iterations, initial_cost or 0.0, final_cost,
+    model, optimizer, input_data, remap = _build_problem(
+        image_indices_cur, camera_indices_cur,
+        point_indices_cur, points_2d_cur,
     )
+    if model is None:
+        _log("no observations after pre-filter, skipping.")
+        return {
+            "extrinsics": extrinsics_full,
+            "intrinsics": intrinsics_full,
+            "points_3d": points_full,
+            "num_iterations": 0,
+            "initial_cost": 0.0,
+            "final_cost": 0.0,
+            "converged": True,
+        }
+
+    initial_cost = model.loss(input_data, None).item()
+    _log("initial cost=%.6f, obs=%d" % (initial_cost, len(image_indices_cur)))
+
+    n_it, loss_hist = _run_ba(model, optimizer, input_data, max_iterations)
+
+    # Write optimised params back.
+    ig_n2o, cm_n2o, pt_n2o = remap
+    if constant_rotation:
+        extrinsics_full[ig_n2o, :3] = (
+            model.translations.data.cpu().numpy())
+    else:
+        extrinsics_full[ig_n2o] = model.extrinsics.data.cpu().numpy()
+    intrinsics_full[cm_n2o] = model.intrinsics.data.cpu().numpy()
+    points_full[pt_n2o] = model.points_3d.data.cpu().numpy()
+
+    final_cost = loss_hist[-1] if loss_hist else initial_cost
+    _log("finished: %d iters, cost %.6f -> %.6f"
+         % (n_it, initial_cost, final_cost))
+
+    # Recompute residual distribution after BA so we can see how much
+    # the optimizer actually moved residuals (in pixels and normalized).
+    post_ext = torch.tensor(
+        extrinsics_full, dtype=torch.float64, device=device)
+    post_intr = torch.tensor(
+        intrinsics_full, dtype=torch.float64, device=device)
+    post_pts3 = torch.tensor(
+        points_full, dtype=torch.float64, device=device)
+    post_pts2 = torch.tensor(
+        points_2d_cur, dtype=torch.float64, device=device)
+    post_ii = torch.tensor(
+        image_indices_cur, dtype=torch.long, device=device)
+    post_ci = torch.tensor(
+        camera_indices_cur, dtype=torch.long, device=device)
+    post_pi = torch.tensor(
+        point_indices_cur, dtype=torch.long, device=device)
+    with torch.no_grad():
+        post_errs = _compute_reprojection_errors(
+            post_ext, post_intr, post_pts3, post_pts2,
+            post_ii, post_ci, post_pi,
+        )
+        post_focals = post_intr[post_ci, 0].clamp(min=1e-8)
+        post_norm = (post_errs / post_focals).cpu().numpy()
+        post_errs_np = post_errs.cpu().numpy()
+    if len(post_errs_np) > 0:
+        ppx = np.percentile(post_errs_np, [50, 90, 99])
+        pn = np.percentile(post_norm, [50, 90, 99])
+        _log(
+            "post err [px]   p50=%.2f p90=%.2f p99=%.2f"
+            % (ppx[0], ppx[1], ppx[2])
+        )
+        _log(
+            "post err [norm] p50=%.2e p90=%.2e p99=%.2e  (colmap_filter=%.2e)"
+            % (pn[0], pn[1], pn[2], 1e-2)
+        )
+    del post_ext, post_intr, post_pts3, post_pts2, post_ii, post_ci, post_pi
+    torch.cuda.empty_cache()
 
     return {
         "extrinsics": extrinsics_full,
         "intrinsics": intrinsics_full,
         "points_3d": points_full,
-        "num_iterations": total_iterations,
-        "initial_cost": initial_cost or 0.0,
+        "num_iterations": n_it,
+        "initial_cost": initial_cost,
         "final_cost": final_cost,
         "converged": True,
     }

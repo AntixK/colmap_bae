@@ -146,16 +146,30 @@ class BaeBundleAdjuster : public BundleAdjuster {
                                     points_3d_.data());
       py::array_t<double> pts2d_arr({si(num_observations_), si(2)},
                                     points_2d_.data());
-      py::array_t<int> img_idx_arr({si(num_observations_)},
-                                   image_indices_.data());
-      py::array_t<int> cam_idx_arr({si(num_observations_)},
-                                   camera_obs_indices_.data());
-      py::array_t<int> pt_idx_arr({si(num_observations_)},
-                                  point_indices_.data());
-      py::array_t<uint8_t> const_pose_arr({si(num_images_)},
-                                          constant_pose_mask_.data());
-      py::array_t<uint8_t> const_pt_arr({si(num_points_)},
-                                        constant_point_mask_.data());
+      // 1D arrays: pybind11's `array_t(ShapeContainer{N}, ptr)` constructor
+      // mis-computes strides for 1D shapes (produces stride=0 → every read
+      // returns the first element).  Pass explicit strides via buffer_info
+      // to force the correct sizeof(T) stride.  Confirmed by the symptom
+      // `unique=1 min=0 max=0` on the Python side despite the C++ vectors
+      // being populated correctly.
+      auto make_1d = [&](auto* ptr, size_t n) {
+          using T = std::remove_pointer_t<decltype(ptr)>;
+          return py::array_t<T>(py::buffer_info(
+              ptr,
+              sizeof(T),
+              py::format_descriptor<T>::format(),
+              1,
+              {si(n)},
+              {si(sizeof(T))}));
+      };
+      auto img_idx_arr = make_1d(image_indices_.data(), num_observations_);
+      auto cam_idx_arr =
+          make_1d(camera_obs_indices_.data(), num_observations_);
+      auto pt_idx_arr = make_1d(point_indices_.data(), num_observations_);
+      auto const_pose_arr =
+          make_1d(constant_pose_mask_.data(), num_images_);
+      auto const_pt_arr =
+          make_1d(constant_point_mask_.data(), num_points_);
 
       // Build options dict from BaeBundleAdjustmentOptions + refine_* flags.
       py::dict options_dict;

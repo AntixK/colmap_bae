@@ -419,7 +419,10 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // Iterative global refinement.
   IncrementalMapper::Options mapper_options;
   mapper_options.random_seed = options.random_seed;
-  mapper.IterativeGlobalRefinement(/*max_num_refinements=*/5,
+  // 3 retri-refinement rounds matches the 3-round outer iterative-BA
+  // schedule above, giving symmetric BA effort across the two stages.
+  // Applies to both backends (Ceres and BAE) — they share this call.
+  mapper.IterativeGlobalRefinement(/*max_num_refinements=*/3,
                                    /*max_refinement_change=*/0.0005,
                                    mapper_options,
                                    custom_ba_options,

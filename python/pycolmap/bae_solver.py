@@ -5,7 +5,20 @@ Follows InstantSFM's TorchBA architecture: base LM optimizer with separate
 parameter blocks and rotate_quat projection.
 """
 
+import os
 import sys
+
+# PYTHONHASHSEED only takes effect at interpreter startup, so writing it
+# here does NOT alter the hash randomisation of the current process (the
+# CLI binary embeds Python and has already initialised it before this
+# module loads).  We set it anyway for two reasons:
+#   1. Subprocesses spawned from this module would inherit a deterministic
+#      seed (we don't spawn any today, but defense in depth).
+#   2. Documents the intent — for full hash determinism, set
+#      PYTHONHASHSEED=0 in the shell that launches colmap (run_benchmark.py
+#      already does this via subprocess env).
+os.environ.setdefault("PYTHONHASHSEED", "0")
+
 import numpy as np
 import pypose as pp
 import torch
@@ -196,24 +209,22 @@ def solve(
 
     # DEBUG: confirm indices arrays from C++ have correct distinct values.
     _log(
-        "DEBUG indices: img_idx shape=%s strides=%s dtype=%s "
-        "unique=%d min=%d max=%d"
-        % (image_indices_np.shape, image_indices_np.strides,
-           image_indices_np.dtype,
-           len(np.unique(image_indices_np)),
-           int(image_indices_np.min()), int(image_indices_np.max()))
+        f"DEBUG indices: img_idx shape={image_indices_np.shape} "
+        f"strides={image_indices_np.strides} dtype={image_indices_np.dtype} "
+        f"unique={len(np.unique(image_indices_np))} "
+        f"min={int(image_indices_np.min())} "
+        f"max={int(image_indices_np.max())}"
     )
     _log(
-        "DEBUG indices: pt_idx  shape=%s strides=%s dtype=%s "
-        "unique=%d min=%d max=%d"
-        % (point_indices_np.shape, point_indices_np.strides,
-           point_indices_np.dtype,
-           len(np.unique(point_indices_np)),
-           int(point_indices_np.min()), int(point_indices_np.max()))
+        f"DEBUG indices: pt_idx  shape={point_indices_np.shape} "
+        f"strides={point_indices_np.strides} dtype={point_indices_np.dtype} "
+        f"unique={len(np.unique(point_indices_np))} "
+        f"min={int(point_indices_np.min())} "
+        f"max={int(point_indices_np.max())}"
     )
     _log(
-        "DEBUG indices: first 10 img_idx=%s  pt_idx=%s"
-        % (image_indices_np[:10].tolist(), point_indices_np[:10].tolist())
+        f"DEBUG indices: first 10 img_idx={image_indices_np[:10].tolist()}  "
+        f"pt_idx={point_indices_np[:10].tolist()}"
     )
 
     # DEBUG workaround: if strides are wrong, re-read raw buffer with
@@ -223,13 +234,13 @@ def solve(
         raw = np.frombuffer(memoryview(image_indices_np).tobytes(),
                             dtype=np.int32)
         _log(
-            "DEBUG raw img_idx via frombuffer: len=%d unique=%d "
-            "min=%d max=%d  first10=%s"
-            % (len(raw), len(np.unique(raw)),
-               int(raw.min()), int(raw.max()), raw[:10].tolist())
+            f"DEBUG raw img_idx via frombuffer: len={len(raw)} "
+            f"unique={len(np.unique(raw))} "
+            f"min={int(raw.min())} max={int(raw.max())}  "
+            f"first10={raw[:10].tolist()}"
         )
     except Exception as e:
-        _log("DEBUG frombuffer failed: %r" % e)
+        _log(f"DEBUG frombuffer failed: {e!r}")
 
     # ------------------------------------------------------------------
     # Pre-BA outlier filtering (adapted from InstantSFM global_mapper
@@ -281,14 +292,16 @@ def solve(
         npcts = np.percentile(valid_norm, [10, 25, 50, 75, 90, 95, 99])
         median_err_px = float(pcts[2])
         _log(
-            "init err [px]   p10=%.2f p25=%.2f p50=%.2f p75=%.2f "
-            "p90=%.2f p95=%.2f p99=%.2f  behind_cam=%d  n=%d"
-            % (*pcts, int((~valid_np).sum()), len(valid_errs))
+            f"init err [px]   p10={pcts[0]:.2f} p25={pcts[1]:.2f} "
+            f"p50={pcts[2]:.2f} p75={pcts[3]:.2f} p90={pcts[4]:.2f} "
+            f"p95={pcts[5]:.2f} p99={pcts[6]:.2f}  "
+            f"behind_cam={int((~valid_np).sum())}  n={len(valid_errs)}"
         )
         _log(
-            "init err [norm] p10=%.2e p25=%.2e p50=%.2e p75=%.2e "
-            "p90=%.2e p95=%.2e p99=%.2e  (colmap_filter=%.2e)"
-            % (*npcts, 1e-2)
+            f"init err [norm] p10={npcts[0]:.2e} p25={npcts[1]:.2e} "
+            f"p50={npcts[2]:.2e} p75={npcts[3]:.2e} p90={npcts[4]:.2e} "
+            f"p95={npcts[5]:.2e} p99={npcts[6]:.2e}  "
+            f"(colmap_filter=1.00e-02)"
         )
 
     # Robust kernel scale (#1): Huber transition at 2 * median pixel
@@ -298,7 +311,7 @@ def solve(
     # noise rather than residual structure.  Scaling the kernel to the
     # actual residual distribution keeps inliers in the quadratic regime.
     kernel_delta = max(2.0 * median_err_px, 1.0)
-    _log("kernel: Huber(delta=%.2f px)" % kernel_delta)
+    _log(f"kernel: Huber(delta={kernel_delta:.2f} px)")
 
     # Pre-filter in NORMALIZED image-plane units (residual / focal).
     # Matches COLMAP's filter convention (max_normalized_reproj_error,
@@ -314,8 +327,8 @@ def solve(
     point_indices_cur = point_indices_cur[keep_mask]
     points_2d_cur = points_2d_cur[keep_mask]
     _log(
-        "pre-filter: kept %d / %d observations (threshold 1.00e-01 norm)"
-        % (len(image_indices_cur), n_before)
+        f"pre-filter: kept {len(image_indices_cur)} / {n_before} "
+        f"observations (threshold 1.00e-01 norm)"
     )
 
     # Track-length distribution log (post norm-filter).  Useful for tuning
@@ -326,10 +339,11 @@ def solve(
     present_lengths = counts_np[counts_np > 0]
     if len(present_lengths) > 0:
         lpcts = np.percentile(present_lengths, [10, 25, 50, 75, 90, 95, 99])
+        lp = lpcts.astype(int)
         _log(
-            "track lengths: p10=%d p25=%d p50=%d p75=%d p90=%d p95=%d "
-            "p99=%d  n_tracks=%d"
-            % (*lpcts.astype(int), len(present_lengths))
+            f"track lengths: p10={lp[0]} p25={lp[1]} p50={lp[2]} "
+            f"p75={lp[3]} p90={lp[4]} p95={lp[5]} p99={lp[6]}  "
+            f"n_tracks={len(present_lengths)}"
         )
 
     # Triangulation-angle filter (#A): drop observations whose track has
@@ -387,9 +401,9 @@ def solve(
         apcts = np.percentile(
             present_angles, [10, 25, 50, 75, 90, 95, 99])
         _log(
-            "track angle [deg]: p10=%.2f p25=%.2f p50=%.2f p75=%.2f "
-            "p90=%.2f p95=%.2f p99=%.2f"
-            % tuple(apcts)
+            f"track angle [deg]: p10={apcts[0]:.2f} p25={apcts[1]:.2f} "
+            f"p50={apcts[2]:.2f} p75={apcts[3]:.2f} p90={apcts[4]:.2f} "
+            f"p95={apcts[5]:.2f} p99={apcts[6]:.2f}"
         )
 
     # Drop obs whose point is inside the degenerate cone.
@@ -401,9 +415,9 @@ def solve(
     point_indices_cur = point_indices_cur[obs_keep]
     points_2d_cur = points_2d_cur[obs_keep]
     _log(
-        "tri-angle filter: kept %d / %d observations "
-        "(max-from-mean >= %.1f deg)"
-        % (len(image_indices_cur), n_before_tri, TRI_ANGLE_DEG)
+        f"tri-angle filter: kept {len(image_indices_cur)} / "
+        f"{n_before_tri} observations "
+        f"(max-from-mean >= {TRI_ANGLE_DEG:.1f} deg)"
     )
 
     del _ext_t, _intr_t, _pts3_t, _pts2_t, _img_idx, _cam_idx, _pt_idx
@@ -432,8 +446,8 @@ def solve(
 
         n_i, n_c, n_p, n_o = len(ig_n2o), len(cm_n2o), len(pt_n2o), len(ii)
         _log(
-            "problem: %d imgs, %d cams, %d pts, %d obs, const_rot=%s"
-            % (n_i, n_c, n_p, n_o, constant_rotation)
+            f"problem: {n_i} imgs, {n_c} cams, {n_p} pts, {n_o} obs, "
+            f"const_rot={constant_rotation}"
         )
         if n_o == 0:
             return None, None, None, (ig_n2o, cm_n2o, pt_n2o)
@@ -479,7 +493,7 @@ def solve(
             loss = opt.step(inp)
             n_it += 1
             loss_hist.append(loss.item())
-            _log("iter %3d  cost=%.6f" % (n_it, loss_hist[-1]))
+            _log(f"iter {n_it:3d}  cost={loss_hist[-1]:.6f}")
             if len(loss_hist) >= 2 * window_size:
                 avg_r = sum(loss_hist[-window_size:]) / window_size
                 avg_p = sum(
@@ -520,7 +534,9 @@ def solve(
         }
 
     initial_cost = model.loss(input_data, None).item()
-    _log("initial cost=%.6f, obs=%d" % (initial_cost, len(image_indices_cur)))
+    _log(
+        f"initial cost={initial_cost:.6f}, obs={len(image_indices_cur)}"
+    )
 
     n_it, loss_hist = _run_ba(model, optimizer, input_data, max_iterations)
 
@@ -535,8 +551,10 @@ def solve(
     points_full[pt_n2o] = model.points_3d.data.cpu().numpy()
 
     final_cost = loss_hist[-1] if loss_hist else initial_cost
-    _log("finished: %d iters, cost %.6f -> %.6f"
-         % (n_it, initial_cost, final_cost))
+    _log(
+        f"finished: {n_it} iters, cost {initial_cost:.6f} -> "
+        f"{final_cost:.6f}"
+    )
 
     # Recompute residual distribution after BA so we can see how much
     # the optimizer actually moved residuals (in pixels and normalized).
@@ -566,12 +584,12 @@ def solve(
         ppx = np.percentile(post_errs_np, [50, 90, 99])
         pn = np.percentile(post_norm, [50, 90, 99])
         _log(
-            "post err [px]   p50=%.2f p90=%.2f p99=%.2f"
-            % (ppx[0], ppx[1], ppx[2])
+            f"post err [px]   p50={ppx[0]:.2f} p90={ppx[1]:.2f} "
+            f"p99={ppx[2]:.2f}"
         )
         _log(
-            "post err [norm] p50=%.2e p90=%.2e p99=%.2e  (colmap_filter=%.2e)"
-            % (pn[0], pn[1], pn[2], 1e-2)
+            f"post err [norm] p50={pn[0]:.2e} p90={pn[1]:.2e} "
+            f"p99={pn[2]:.2e}  (colmap_filter=1.00e-02)"
         )
     del post_ext, post_intr, post_pts3, post_pts2, post_ii, post_ci, post_pi
     torch.cuda.empty_cache()

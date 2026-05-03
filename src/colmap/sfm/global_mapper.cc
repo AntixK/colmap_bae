@@ -1,5 +1,6 @@
 #include "colmap/sfm/global_mapper.h"
 
+#include "colmap/estimators/bundle_adjustment_bae.h"
 #include "colmap/estimators/rotation_averaging.h"
 #include "colmap/math/union_find.h"
 #include "colmap/scene/projection.h"
@@ -414,6 +415,14 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   if (custom_ba_options.ceres) {
     custom_ba_options.ceres->solver_options.max_num_iterations = 50;
     custom_ba_options.ceres->solver_options.max_linear_solver_iterations = 100;
+  }
+  // Symmetric cap for BAE: matches Ceres' 50-iter cap above so the two
+  // backends do equal work per refinement round.  Without this, BAE was
+  // running its default 100-iter cap and consistently hitting it on every
+  // refinement call (50% extra iterations vs Ceres for ~1-2% extra cost
+  // reduction — diminishing returns past ~50).
+  if (custom_ba_options.bae) {
+    custom_ba_options.bae->max_num_iterations = 50;
   }
 
   // Iterative global refinement.

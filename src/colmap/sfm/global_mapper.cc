@@ -11,9 +11,91 @@
 #include "colmap/util/timer.h"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace colmap {
 namespace {
+
+// Diagnostic: sweep all observations of `reconstruction`, compute per-obs
+// reprojection error, and log the percentile distribution in both pixel
+// and normalized (residual / focal length) units.  The normalized form
+// is directly comparable to COLMAP's filter cutoff (typically 1e-2).
+//
+// Tag is included in the log line so per-stage data is greppable, e.g.
+// "[reproj iter1.fixed_rot]" or "[reproj retri.final]".  Used to bisect
+// where BAE and Ceres diverge in convergence quality.
+void LogReprojectionResiduals(const Reconstruction& reconstruction,
+                              const std::string& tag) {
+  std::vector<double> errs_px;
+  std::vector<double> errs_norm;
+  errs_px.reserve(reconstruction.NumPoints3D() * 4);
+  errs_norm.reserve(reconstruction.NumPoints3D() * 4);
+
+  for (const auto& [image_id, image] : reconstruction.Images()) {
+    if (!image.HasPose()) continue;
+    if (!image.HasCameraPtr()) continue;
+    const Camera& camera = *image.CameraPtr();
+    if (camera.params.empty()) continue;
+    // SIMPLE_RADIAL params: [f, cx, cy, k1].  Other models also have f at
+    // index 0 in COLMAP's conventions for the camera models we support.
+    const double focal = camera.params[0];
+    if (focal <= 0.0) continue;
+    for (const Point2D& point2D : image.Points2D()) {
+      if (!point2D.HasPoint3D()) continue;
+      if (!reconstruction.ExistsPoint3D(point2D.point3D_id)) continue;
+      const Eigen::Vector3d& xyz =
+          reconstruction.Point3D(point2D.point3D_id).xyz;
+      const auto proj = image.ProjectPoint(xyz);
+      if (!proj.has_value()) continue;
+      const double err_px = (*proj - point2D.xy).norm();
+      errs_px.push_back(err_px);
+      errs_norm.push_back(err_px / focal);
+    }
+  }
+
+  if (errs_px.empty()) {
+    LOG(INFO) << "[reproj " << tag << "] no observations to evaluate";
+    return;
+  }
+
+  std::sort(errs_px.begin(), errs_px.end());
+  std::sort(errs_norm.begin(), errs_norm.end());
+  const auto pct = [](const std::vector<double>& v, double p) {
+    const size_t k =
+        static_cast<size_t>(p * static_cast<double>(v.size() - 1));
+    return v[k];
+  };
+  const std::array<double, 7> qs{0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99};
+
+  auto fmt_line =
+      [&](const std::vector<double>& v, const std::string& unit_label,
+          const std::string& fmt_spec) {
+        std::ostringstream oss;
+        oss << "[reproj " << tag << "] n=" << v.size() << "  ["
+            << unit_label << "]  ";
+        oss << std::fixed;
+        for (size_t i = 0; i < qs.size(); ++i) {
+          oss << "p" << static_cast<int>(qs[i] * 100) << "=";
+          if (fmt_spec == "scientific") {
+            oss << std::scientific << std::setprecision(2) << pct(v, qs[i])
+                << std::fixed;
+          } else {
+            oss << std::setprecision(3) << pct(v, qs[i]);
+          }
+          if (i + 1 < qs.size()) oss << " ";
+        }
+        return oss.str();
+      };
+
+  LOG(INFO) << fmt_line(errs_px, "px", "fixed");
+  LOG(INFO) << fmt_line(errs_norm, "norm", "scientific")
+            << "  (filter=1.00e-02)";
+}
 
 bool RunBundleAdjustment(const BundleAdjustmentOptions& options,
                          Reconstruction& reconstruction) {
@@ -315,6 +397,11 @@ bool GlobalMapper::IterativeBundleAdjustment(
     int num_iterations,
     bool skip_fixed_rotation_stage,
     bool skip_joint_optimization_stage) {
+  // Diagnostic baseline: residual distribution before any BA optimization.
+  // This is the post-global-positioning state — useful as a reference
+  // when comparing how much each backend reduces the tail.
+  LogReprojectionResiduals(*reconstruction_, "iter_ba.start");
+
   for (int ite = 0; ite < num_iterations; ite++) {
     // Optional fixed-rotation stage: optimize positions only
     if (!skip_fixed_rotation_stage) {
@@ -325,6 +412,9 @@ bool GlobalMapper::IterativeBundleAdjustment(
       }
       LOG(INFO) << "Global bundle adjustment iteration " << ite + 1 << " / "
                 << num_iterations << ", fixed-rotation stage finished";
+      LogReprojectionResiduals(
+          *reconstruction_,
+          "iter" + std::to_string(ite + 1) + ".fixed_rot");
     }
 
     // Joint optimization stage: default BA
@@ -332,6 +422,9 @@ bool GlobalMapper::IterativeBundleAdjustment(
       if (!RunBundleAdjustment(options, *reconstruction_)) {
         return false;
       }
+      LogReprojectionResiduals(
+          *reconstruction_,
+          "iter" + std::to_string(ite + 1) + ".full");
     }
     LOG(INFO) << "Global bundle adjustment iteration " << ite + 1 << " / "
               << num_iterations << " finished";
@@ -380,6 +473,8 @@ bool GlobalMapper::IterativeBundleAdjustment(
     obs_manager.FilterPoints3DWithSmallTriangulationAngle(
         min_tri_angle_deg, reconstruction_->Point3DIds());
   }
+  // Final post-iter_BA residual distribution (after all BA + final filter).
+  LogReprojectionResiduals(*reconstruction_, "iter_ba.final");
 
   return true;
 }
@@ -400,6 +495,9 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   for (const auto image_id : reconstruction_->RegImageIds()) {
     mapper.TriangulateImage(options, image_id);
   }
+  // Diagnostic: residuals just after retriangulation, before refinement.
+  // Tells us how good the un-refined retriangulation is.
+  LogReprojectionResiduals(*reconstruction_, "retri.post_triangulate");
 
   // Set up bundle adjustment options for colmap's incremental mapper.
   // Inherit from ba_options so the user's --ba_backend choice (and any
@@ -437,6 +535,11 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
                                    custom_ba_options,
                                    options,
                                    /*normalize_reconstruction=*/true);
+  // Diagnostic: residuals after IterativeGlobalRefinement (3 rounds of
+  // BA + filter inside).  Reflects the quality the chosen backend (BAE
+  // or Ceres, depending on custom_ba_options.backend) achieved on the
+  // re-triangulated tracks.
+  LogReprojectionResiduals(*reconstruction_, "retri.refinement_done");
 
   mapper.EndReconstruction(/*discard=*/false);
 
@@ -450,6 +553,10 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   if (!RunBundleAdjustment(ba_options, *reconstruction_)) {
     return false;
   }
+  // Diagnostic: residuals after the FINAL BA call of the entire pipeline.
+  // This is the data the model_analyzer will see.  Compare to Ceres'
+  // equivalent line in the matching run.log.
+  LogReprojectionResiduals(*reconstruction_, "retri.final_ba");
 
   // Normalize the structure for numerical stability.
   // TODO: Skip normalization when position priors are used (similar to
@@ -462,6 +569,10 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
       ReprojectionErrorType::NORMALIZED);
   obs_manager.FilterPoints3DWithSmallTriangulationAngle(
       min_tri_angle_deg, reconstruction_->Point3DIds());
+  // Final post-pipeline residual snapshot.  By construction this should
+  // be at or below the COLMAP filter threshold (1e-2 normalized) for
+  // every kept observation.
+  LogReprojectionResiduals(*reconstruction_, "retri.final_filtered");
 
   return true;
 }

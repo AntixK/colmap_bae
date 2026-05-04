@@ -41,27 +41,53 @@ def _log(msg):
 
 
 def _distort_and_project(points_cam, intrinsics):
-    """Perspective divide + radial distortion + focal scaling."""
+    """Perspective divide + SIMPLE_RADIAL distortion + focal scaling."""
     points_proj = points_cam[..., :2] / points_cam[..., 2].unsqueeze(-1)
     f = intrinsics[..., 0].unsqueeze(-1)
     k1 = intrinsics[..., 1].unsqueeze(-1)
-    k2 = intrinsics[..., 2].unsqueeze(-1)
     n = torch.sum(points_proj**2, dim=-1, keepdim=True)
-    r = 1 + k1 * n + k2 * n**2
+    # BAE is currently restricted to COLMAP SIMPLE_RADIAL, which only has k1.
+    # The third slot is kept in the buffer for bridge compatibility and must
+    # remain semantically inert.
+    r = 1 + k1 * n
     return points_proj * r * f
+
+
+def _transform_points(extrinsics, points):
+    """Apply row-major 3x4 world-to-camera extrinsics to 3D points."""
+    rotations = extrinsics[..., :3]
+    translations = extrinsics[..., 3]
+    return torch.matmul(rotations, points.unsqueeze(-1)).squeeze(-1) + translations
+
+
+def _rotate_points_xyzw(quaternions, points):
+    """Rotate 3D points by xyzw quaternions using pure Torch ops."""
+    q = quaternions / quaternions.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+    q_xyz = q[..., :3]
+    q_w = q[..., 3:4]
+    twice_cross = 2.0 * torch.cross(q_xyz, points, dim=-1)
+    return points + q_w * twice_cross + torch.cross(q_xyz, twice_cross, dim=-1)
+
+
+def _transform_points_se3(extrinsics, points):
+    """Apply PyPose SE3.data poses in COLMAP world-to-camera convention."""
+    translations = extrinsics[..., :3]
+    quaternions_xyzw = extrinsics[..., 3:7]
+    rotated = _rotate_points_xyzw(quaternions_xyzw, points)
+    return rotated + translations
 
 
 @map_transform
 def colmap_project(points, extrinsics, intrinsics):
-    """Project using SE3 extrinsics (same as TorchBA's rotate_quat)."""
-    points_cam = rotate_quat(points, extrinsics)
+    """Project using SE3 extrinsics converted to COLMAP matrices."""
+    points_cam = _transform_points_se3(extrinsics, points)
     return _distort_and_project(points_cam, intrinsics)
 
 
 @map_transform
 def colmap_project_fixed_rot(points, translations, rotations, intrinsics):
     """Project with fixed rotations: only translations are optimized."""
-    rotated = pp.SO3(rotations).Act(points)
+    rotated = torch.matmul(rotations, points.unsqueeze(-1)).squeeze(-1)
     points_cam = rotated + translations
     return _distort_and_project(points_cam, intrinsics)
 
@@ -140,22 +166,21 @@ def _compute_reprojection_errors(
     and returns the L2 distance to the (already-centred) 2D observation.
     """
     pts = points_3d[point_indices]                    # (N, 3)
-    ext = extrinsics[image_indices]                   # (N, 7)
+    ext = extrinsics[image_indices]                   # (N, 3, 4)
     intr = intrinsics[camera_indices]                 # (N, 3)
 
-    # R * p + t  via pypose SE3
-    pts_cam = pp.SE3(ext).Act(pts)                    # (N, 3)
+    # Apply COLMAP's world-to-camera extrinsics directly in matrix form.
+    pts_cam = _transform_points(ext, pts)             # (N, 3)
 
     # Perspective divide
     z = pts_cam[:, 2:3].clamp(min=1e-8)
     uv = pts_cam[:, :2] / z                           # (N, 2)
 
-    # Radial distortion
+    # SIMPLE_RADIAL distortion
     f  = intr[:, 0:1]
     k1 = intr[:, 1:2]
-    k2 = intr[:, 2:3]
     r2 = (uv * uv).sum(dim=-1, keepdim=True)
-    dist = 1.0 + k1 * r2 + k2 * r2 * r2
+    dist = 1.0 + k1 * r2
     proj = uv * dist * f                              # (N, 2)
 
     return (proj - points_2d).norm(dim=-1)            # (N,)
@@ -177,10 +202,181 @@ def _filter_observations_by_reproj(
             image_indices, camera_indices, point_indices,
         )
     # Also reject points behind the camera (z <= 0).
-    pts_cam_z = pp.SE3(extrinsics[image_indices]).Act(
-        points_3d[point_indices])[:, 2]
+    pts_cam_z = _transform_points(
+        extrinsics[image_indices], points_3d[point_indices])[:, 2]
     keep = (errs < max_error) & (pts_cam_z > 0)
     return keep
+
+
+def _log_probe_errors(
+    tag,
+    extrinsics,
+    intrinsics,
+    points_3d,
+    probe_image_indices_np,
+    probe_camera_indices_np,
+    probe_point_indices_np,
+    probe_points_2d_np,
+    probe_labels,
+):
+    if probe_image_indices_np is None or len(probe_image_indices_np) == 0:
+        _log(f"probe {tag}: no probes configured")
+        return
+
+    device = extrinsics.device
+    probe_img = torch.as_tensor(
+        probe_image_indices_np, dtype=torch.long, device=device)
+    probe_cam = torch.as_tensor(
+        probe_camera_indices_np, dtype=torch.long, device=device)
+    probe_pt = torch.as_tensor(
+        probe_point_indices_np, dtype=torch.long, device=device)
+    probe_obs = torch.as_tensor(
+        probe_points_2d_np, dtype=torch.float64, device=device)
+
+    with torch.no_grad():
+        errs = _compute_reprojection_errors(
+            extrinsics, intrinsics, points_3d, probe_obs,
+            probe_img, probe_cam, probe_pt,
+        )
+        pts_cam = _transform_points(
+            extrinsics[probe_img], points_3d[probe_pt])
+        depths = pts_cam[:, 2]
+
+    errs_np = errs.detach().cpu().numpy()
+    depths_np = depths.detach().cpu().numpy()
+    if len(errs_np) == 0:
+        _log(f"probe {tag}: no valid probe residuals")
+        return
+
+    p50, p90, p100 = np.percentile(errs_np, [50, 90, 100])
+    _log(
+        f"probe {tag}: n={len(errs_np)} p50={p50:.3f} "
+        f"p90={p90:.3f} max={p100:.3f}"
+    )
+    for i, label in enumerate(probe_labels[:len(errs_np)]):
+        _log(
+            f"probe {tag} #{i}: {label} "
+            f"err_px={errs_np[i]:.3f} depth={depths_np[i]:.6f}"
+        )
+
+
+def _log_se3_projection_consistency(
+    tag,
+    extrinsics,
+    intrinsics,
+    points_3d,
+    probe_image_indices_np,
+    probe_camera_indices_np,
+    probe_point_indices_np,
+    probe_labels,
+):
+    if probe_image_indices_np is None or len(probe_image_indices_np) == 0:
+        _log(f"se3 projector {tag}: no probes configured")
+        return
+
+    device = extrinsics.device
+    probe_img = torch.as_tensor(
+        probe_image_indices_np, dtype=torch.long, device=device)
+    probe_cam = torch.as_tensor(
+        probe_camera_indices_np, dtype=torch.long, device=device)
+    probe_pt = torch.as_tensor(
+        probe_point_indices_np, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        pts = points_3d[probe_pt]
+        ext = extrinsics[probe_img]
+        intr = intrinsics[probe_cam]
+        points_cam_quat = rotate_quat(pts, ext)
+        points_cam_matrix = _transform_points_se3(ext, pts)
+        proj_quat = _distort_and_project(points_cam_quat, intr)
+        proj_matrix = _distort_and_project(points_cam_matrix, intr)
+        cam_diffs = (points_cam_quat - points_cam_matrix).norm(dim=-1)
+        proj_diffs = (proj_quat - proj_matrix).norm(dim=-1)
+
+    cam_diffs_np = cam_diffs.cpu().numpy()
+    proj_diffs_np = proj_diffs.cpu().numpy()
+    if len(cam_diffs_np) == 0:
+        _log(f"se3 projector {tag}: no valid probe residuals")
+        return
+
+    cam_p50, cam_p90, cam_max = np.percentile(cam_diffs_np, [50, 90, 100])
+    proj_p50, proj_p90, proj_max = np.percentile(proj_diffs_np, [50, 90, 100])
+    _log(
+        f"se3 projector {tag}: "
+        f"cam_diff p50={cam_p50:.6e} p90={cam_p90:.6e} max={cam_max:.6e}  "
+        f"proj_diff p50={proj_p50:.6e} p90={proj_p90:.6e} max={proj_max:.6e}"
+    )
+    for i, label in enumerate(probe_labels[:len(proj_diffs_np)]):
+        _log(
+            f"se3 projector {tag} #{i}: {label} "
+            f"cam_diff={cam_diffs_np[i]:.6e} "
+            f"proj_diff={proj_diffs_np[i]:.6e}"
+        )
+
+
+def _log_parameter_drifts(
+    extrinsics_before,
+    extrinsics_after,
+    intrinsics_before,
+    intrinsics_after,
+    points_before,
+    points_after,
+    constant_pose_mask_np,
+    constant_point_mask_np,
+    refine_focal_length,
+    refine_extra_params,
+):
+    constant_pose_mask = constant_pose_mask_np.astype(bool)
+    if constant_pose_mask.any():
+        trans_before = extrinsics_before[:, :, 3]
+        trans_after = extrinsics_after[:, :, 3]
+        trans_delta = np.linalg.norm(trans_after - trans_before, axis=1)
+        rot_delta = np.linalg.norm(
+            extrinsics_after[:, :, :3] - extrinsics_before[:, :, :3],
+            axis=(1, 2),
+        )
+        trans_const = trans_delta[constant_pose_mask]
+        rot_const = rot_delta[constant_pose_mask]
+        _log(
+            "const pose drift: "
+            f"n={len(trans_const)} "
+            f"t_p50={np.percentile(trans_const, 50):.6e} "
+            f"t_max={np.max(trans_const):.6e} "
+            f"Rfro_p50={np.percentile(rot_const, 50):.6e} "
+            f"Rfro_max={np.max(rot_const):.6e}"
+        )
+
+    constant_point_mask = constant_point_mask_np.astype(bool)
+    if constant_point_mask.any():
+        point_delta = np.linalg.norm(points_after - points_before, axis=1)
+        point_const = point_delta[constant_point_mask]
+        _log(
+            "const point drift: "
+            f"n={len(point_const)} "
+            f"p50={np.percentile(point_const, 50):.6e} "
+            f"max={np.max(point_const):.6e}"
+        )
+
+    focal_delta = np.abs(intrinsics_after[:, 0] - intrinsics_before[:, 0])
+    extra_delta = np.abs(intrinsics_after[:, 1:] - intrinsics_before[:, 1:])
+    if not refine_focal_length:
+        _log(
+            "focal drift while disabled: "
+            f"p50={np.percentile(focal_delta, 50):.6e} "
+            f"max={np.max(focal_delta):.6e}"
+        )
+    if not refine_extra_params:
+        extra_norm = np.linalg.norm(extra_delta, axis=1)
+        _log(
+            "extra-param drift while disabled: "
+            f"p50={np.percentile(extra_norm, 50):.6e} "
+            f"max={np.max(extra_norm):.6e}"
+        )
+
+
+def _extrinsics_matrices_to_se3_data_numpy(extrinsics_np):
+    se3 = pp.mat2SE3(torch.as_tensor(extrinsics_np, dtype=torch.float64))
+    return np.ascontiguousarray(se3.data.cpu().numpy())
 
 
 def solve(
@@ -199,9 +395,20 @@ def solve(
         "constant_rig_from_world_rotation", False,
     )
 
-    extrinsics_full = extrinsics_np.reshape(-1, 7)
+    extrinsics_full = extrinsics_np.reshape(-1, 3, 4)
     intrinsics_full = intrinsics_np.reshape(-1, 3)
     points_full = points_3d_np.reshape(-1, 3)
+    # SIMPLE_RADIAL only: keep the compatibility slot semantically zero.
+    intrinsics_full[:, 2] = 0.0
+    extrinsics_before = extrinsics_full.copy()
+    intrinsics_before = intrinsics_full.copy()
+    points_before = points_full.copy()
+
+    probe_image_indices_np = options_dict.get("probe_image_indices")
+    probe_camera_indices_np = options_dict.get("probe_camera_indices")
+    probe_point_indices_np = options_dict.get("probe_point_indices")
+    probe_points_2d_np = options_dict.get("probe_points_2d")
+    probe_labels = list(options_dict.get("probe_labels", []))
 
     n_imgs_orig = extrinsics_full.shape[0]
     n_cams_orig = intrinsics_full.shape[0]
@@ -271,7 +478,7 @@ def solve(
             _ext_t, _intr_t, _pts3_t, _pts2_t,
             _img_idx, _cam_idx, _pt_idx,
         )
-        pts_z = pp.SE3(_ext_t[_img_idx]).Act(_pts3_t[_pt_idx])[:, 2]
+        pts_z = _transform_points(_ext_t[_img_idx], _pts3_t[_pt_idx])[:, 2]
         valid = pts_z > 0
         # Per-observation focal length (column 0 of intrinsics).  Used to
         # convert pixel residuals to normalized image-plane units —
@@ -303,14 +510,26 @@ def solve(
             f"p95={npcts[5]:.2e} p99={npcts[6]:.2e}  "
             f"(colmap_filter=1.00e-02)"
         )
+    _log_probe_errors(
+        "pre_opt",
+        _ext_t,
+        _intr_t,
+        _pts3_t,
+        probe_image_indices_np,
+        probe_camera_indices_np,
+        probe_point_indices_np,
+        probe_points_2d_np,
+        probe_labels,
+    )
 
-    # Robust kernel scale (#1): Huber transition at 2 * median pixel
-    # residual.  With a bad initialization (median ~500 px) Huber(1.0)
-    # puts every observation in the linear regime, so all gradients become
-    # constant-magnitude and the LM step direction is dominated by sign
-    # noise rather than residual structure.  Scaling the kernel to the
-    # actual residual distribution keeps inliers in the quadratic regime.
-    kernel_delta = max(2.0 * median_err_px, 1.0)
+    # Huber kernel: fixed delta = 1.0 px to match Ceres' HuberLoss(1.0)
+    # used by COLMAP's global mapper.  Earlier we used delta = 2*median
+    # (adaptive), but the four-dataset benchmark showed BAE's mean reproj
+    # error consistently exceeds Ceres' (1.03x ignatius, 1.38x bridge,
+    # 2.05x mihama, 3.24x soil) which causes ~50% point loss on
+    # bridge/soil through COLMAP's downstream filter.  Matching Ceres'
+    # kernel exactly is the principled apples-to-apples choice.
+    kernel_delta = 1.0
     _log(f"kernel: Huber(delta={kernel_delta:.2f} px)")
 
     # Pre-filter in NORMALIZED image-plane units (residual / focal).
@@ -331,10 +550,7 @@ def solve(
         f"observations (threshold 1.00e-01 norm)"
     )
 
-    # Track-length distribution log (post norm-filter).  Useful for tuning
-    # any future min-track filter — sequential matching with overlap=N
-    # produces tracks of length 5..N+ typically; isolated short tracks
-    # (length 2) survive only when matching gaps are large.
+    # Track-length distribution log (post norm-filter).  Diagnostic only.
     counts_np = np.bincount(point_indices_cur, minlength=n_pts_orig)
     present_lengths = counts_np[counts_np > 0]
     if len(present_lengths) > 0:
@@ -346,84 +562,15 @@ def solve(
             f"n_tracks={len(present_lengths)}"
         )
 
-    # Triangulation-angle filter (#A): drop observations whose track has
-    # near-degenerate parallax.  A track with all rays within a tight cone
-    # is poorly conditioned: tiny perturbations of the 3D point change
-    # depth dramatically without changing the projected residual, so BA
-    # can't find a descent direction.  These are the observations that
-    # survive a residual filter (small residual) but pin BA at a
-    # high-residual plateau (~6e-2 norm in our case).
-    #
-    # We compute, per point, the maximum angle between any of its rays
-    # and the mean ray (a fast O(N_obs) proxy for max pairwise angle —
-    # max-pairwise is bounded by 2x max-from-mean, so this is at worst
-    # 2x stricter than the true pairwise threshold).  COLMAP's
-    # incremental mapper uses a 1.5deg minimum (incremental_mapper.h:126).
-    TRI_ANGLE_DEG = 1.5
-    cos_thresh = float(np.cos(np.radians(TRI_ANGLE_DEG)))
-
-    img_idx_t = torch.tensor(image_indices_cur, dtype=torch.long, device=device)
-    pt_idx_t = torch.tensor(point_indices_cur, dtype=torch.long, device=device)
-    ext_t = torch.tensor(extrinsics_full, dtype=torch.float64, device=device)
-    pts3_t = torch.tensor(points_full, dtype=torch.float64, device=device)
-
-    # Camera centers in world frame.  Existing convention: pp.SO3(q).Act(p)
-    # rotates world -> cam, then + t gives cam-frame point (lines 51-52,
-    # 92-98).  Therefore cam_center_world = -SO3(q).Inv().Act(t).
-    quats = ext_t[:, 3:7]
-    trans = ext_t[:, :3]
-    cam_centers = -pp.SO3(quats).Inv().Act(trans)
-
-    # Per-obs unit ray from camera center to 3D point in world frame.
-    rays = pts3_t[pt_idx_t] - cam_centers[img_idx_t]
-    rays_unit = rays / rays.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-
-    # Per-point mean ray (sum of unit rays, then normalize).
-    sum_ray = torch.zeros(n_pts_orig, 3, dtype=torch.float64, device=device)
-    sum_ray.scatter_add_(
-        0, pt_idx_t.unsqueeze(-1).expand(-1, 3), rays_unit)
-    mean_ray = sum_ray / sum_ray.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-
-    # Per-obs dot to its track's mean ray.  Per-point min dot = max angle
-    # from mean.  Initialize to >1 sentinel so empty tracks don't pass.
-    dots = (rays_unit * mean_ray[pt_idx_t]).sum(dim=-1)
-    min_dot_per_pt = torch.full(
-        (n_pts_orig,), 1.0 + 1e-9, dtype=torch.float64, device=device)
-    min_dot_per_pt.scatter_reduce_(0, pt_idx_t, dots, reduce="amin")
-
-    # Log angle distribution (only over points present in our obs set).
-    present_mask = torch.zeros(n_pts_orig, dtype=torch.bool, device=device)
-    present_mask[pt_idx_t] = True
-    min_angles_deg = torch.rad2deg(
-        torch.arccos(min_dot_per_pt.clamp(-1.0, 1.0)))
-    present_angles = min_angles_deg[present_mask].cpu().numpy()
-    if len(present_angles) > 0:
-        apcts = np.percentile(
-            present_angles, [10, 25, 50, 75, 90, 95, 99])
-        _log(
-            f"track angle [deg]: p10={apcts[0]:.2f} p25={apcts[1]:.2f} "
-            f"p50={apcts[2]:.2f} p75={apcts[3]:.2f} p90={apcts[4]:.2f} "
-            f"p95={apcts[5]:.2f} p99={apcts[6]:.2f}"
-        )
-
-    # Drop obs whose point is inside the degenerate cone.
-    track_keep_pt = (min_dot_per_pt < cos_thresh).cpu().numpy()
-    obs_keep = track_keep_pt[point_indices_cur]
-    n_before_tri = len(image_indices_cur)
-    image_indices_cur = image_indices_cur[obs_keep]
-    camera_indices_cur = camera_indices_cur[obs_keep]
-    point_indices_cur = point_indices_cur[obs_keep]
-    points_2d_cur = points_2d_cur[obs_keep]
-    _log(
-        f"tri-angle filter: kept {len(image_indices_cur)} / "
-        f"{n_before_tri} observations "
-        f"(max-from-mean >= {TRI_ANGLE_DEG:.1f} deg)"
-    )
+    # Note: tri-angle filter removed (was 0.5° max-from-mean cone drop).
+    # Four-dataset benchmark showed it had no measurable effect on point
+    # retention (the 1.5°→0.5° change moved soil retention 47.4%→46.7%),
+    # confirming it was not the cause of point loss.  Ceres BA has no
+    # analogous pre-filter inside the solver — it relies on the Huber
+    # kernel for down-weighting and COLMAP's downstream filter for hard
+    # rejection.  We now match that architecture.
 
     del _ext_t, _intr_t, _pts3_t, _pts2_t, _img_idx, _cam_idx, _pt_idx
-    del img_idx_t, pt_idx_t, ext_t, pts3_t, cam_centers
-    del rays, rays_unit, sum_ray, mean_ray, dots, min_dot_per_pt
-    del min_angles_deg, present_mask
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -439,6 +586,7 @@ def solve(
         ext_c = extrinsics_full[ig_n2o]
         intr_c = intrinsics_full[cm_n2o]
         pts_c = points_full[pt_n2o]
+        intr_c[:, 2] = 0.0
 
         ii = ig_o2n[img_idx_np]
         ci = cm_o2n[cam_idx_np]
@@ -461,15 +609,16 @@ def solve(
 
         if constant_rotation:
             tr_t = torch.tensor(
-                ext_c[:, :3], dtype=torch.float64, device=device)
+                ext_c[:, :, 3], dtype=torch.float64, device=device)
             ro_t = torch.tensor(
-                ext_c[:, 3:7], dtype=torch.float64, device=device)
+                ext_c[:, :, :3], dtype=torch.float64, device=device)
             mdl = ColmapReprojFixedRot(tr_t, intr_t, p3_t).to(device)
             inp = {"points_2d": p2_t, "image_indices": ii_t,
                    "camera_indices": ci_t, "point_indices": pi_t,
                    "rotations": ro_t}
         else:
-            ex_t = torch.tensor(ext_c, dtype=torch.float64, device=device)
+            ex_t = pp.mat2SE3(
+                torch.tensor(ext_c, dtype=torch.float64, device=device))
             mdl = ColmapReproj(ex_t, intr_t, p3_t).to(device)
             inp = {"points_2d": p2_t, "image_indices": ii_t,
                    "camera_indices": ci_t, "point_indices": pi_t}
@@ -525,6 +674,10 @@ def solve(
         _log("no observations after pre-filter, skipping.")
         return {
             "extrinsics": extrinsics_full,
+            "extrinsics_se3_data": (
+                None if constant_rotation else
+                _extrinsics_matrices_to_se3_data_numpy(extrinsics_full)
+            ),
             "intrinsics": intrinsics_full,
             "points_3d": points_full,
             "num_iterations": 0,
@@ -542,12 +695,26 @@ def solve(
 
     # Write optimised params back.
     ig_n2o, cm_n2o, pt_n2o = remap
+    optimized_extrinsics_se3_full = None
     if constant_rotation:
-        extrinsics_full[ig_n2o, :3] = (
+        extrinsics_full[ig_n2o, :, 3] = (
             model.translations.data.cpu().numpy())
     else:
-        extrinsics_full[ig_n2o] = model.extrinsics.data.cpu().numpy()
+        assert model.extrinsics.data.shape[-1] == 7, (
+            "Expected PyPose SE3 parameters to have trailing dimension 7, "
+            f"got {tuple(model.extrinsics.data.shape)}")
+        optimized_extrinsics_se3 = model.extrinsics.data.contiguous()
+        # `matrix()[:, :3, :]` is a strided view. Make it contiguous before
+        # converting to NumPy so the C++ side can safely memcpy the result.
+        optimized_extrinsics = (
+            pp.SE3(optimized_extrinsics_se3).matrix()[:, :3, :].contiguous())
+        extrinsics_full[ig_n2o] = optimized_extrinsics.cpu().numpy()
+        optimized_extrinsics_se3_full = (
+            _extrinsics_matrices_to_se3_data_numpy(extrinsics_full))
+        optimized_extrinsics_se3_full[ig_n2o] = np.ascontiguousarray(
+            optimized_extrinsics_se3.cpu().numpy())
     intrinsics_full[cm_n2o] = model.intrinsics.data.cpu().numpy()
+    intrinsics_full[:, 2] = 0.0
     points_full[pt_n2o] = model.points_3d.data.cpu().numpy()
 
     final_cost = loss_hist[-1] if loss_hist else initial_cost
@@ -591,13 +758,50 @@ def solve(
             f"post err [norm] p50={pn[0]:.2e} p90={pn[1]:.2e} "
             f"p99={pn[2]:.2e}  (colmap_filter=1.00e-02)"
         )
+    _log_probe_errors(
+        "post_opt",
+        post_ext,
+        post_intr,
+        post_pts3,
+        probe_image_indices_np,
+        probe_camera_indices_np,
+        probe_point_indices_np,
+        probe_points_2d_np,
+        probe_labels,
+    )
+    if not constant_rotation:
+        _log_se3_projection_consistency(
+            "post_opt",
+            model.extrinsics.data,
+            model.intrinsics.data,
+            model.points_3d.data,
+            probe_image_indices_np,
+            probe_camera_indices_np,
+            probe_point_indices_np,
+            probe_labels,
+        )
+    _log_parameter_drifts(
+        extrinsics_before,
+        extrinsics_full,
+        intrinsics_before,
+        intrinsics_full,
+        points_before,
+        points_full,
+        constant_pose_mask_np,
+        constant_point_mask_np,
+        options_dict.get("refine_focal_length", True),
+        options_dict.get("refine_extra_params", True),
+    )
     del post_ext, post_intr, post_pts3, post_pts2, post_ii, post_ci, post_pi
     torch.cuda.empty_cache()
 
     return {
-        "extrinsics": extrinsics_full,
-        "intrinsics": intrinsics_full,
-        "points_3d": points_full,
+        "extrinsics": np.ascontiguousarray(extrinsics_full),
+        "extrinsics_se3_data": (
+            optimized_extrinsics_se3_full
+        ),
+        "intrinsics": np.ascontiguousarray(intrinsics_full),
+        "points_3d": np.ascontiguousarray(points_full),
         "num_iterations": n_it,
         "initial_cost": initial_cost,
         "final_cost": final_cost,

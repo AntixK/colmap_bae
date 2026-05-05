@@ -509,7 +509,7 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // user-defined copy ctor that std::make_shared's the sub-options), so
   // mutating custom_ba_options.ceres below does NOT alias ba_options.
   BundleAdjustmentOptions custom_ba_options = ba_options;
-  custom_ba_options.print_summary = false;
+  custom_ba_options.print_summary = true;
   if (custom_ba_options.ceres) {
     custom_ba_options.ceres->solver_options.max_num_iterations = 50;
     custom_ba_options.ceres->solver_options.max_linear_solver_iterations = 100;

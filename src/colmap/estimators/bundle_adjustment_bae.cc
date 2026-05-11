@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
@@ -226,6 +228,34 @@ class BaeBundleAdjuster : public BundleAdjuster {
       options_dict["probe_point_indices"] = probe_pt_arr;
       options_dict["probe_points_2d"] = probe_pts2d_arr;
       options_dict["probe_labels"] = probe_labels;
+      options_dict["gauge_mode"] =
+          BundleAdjustmentGaugeToString(gauge_selection_.mode);
+      options_dict["gauge_already_fixed"] = gauge_selection_.already_fixed;
+      options_dict["gauge_anchor_image_idx"] =
+          gauge_selection_.anchor_image_idx;
+      options_dict["gauge_second_image_idx"] =
+          gauge_selection_.second_image_idx;
+      options_dict["gauge_anchor_image_id"] =
+          static_cast<long long>(gauge_selection_.anchor_image_id);
+      options_dict["gauge_second_image_id"] =
+          static_cast<long long>(gauge_selection_.second_image_id);
+      options_dict["gauge_anchor_frame_id"] =
+          static_cast<long long>(gauge_selection_.anchor_frame_id);
+      options_dict["gauge_second_frame_id"] =
+          static_cast<long long>(gauge_selection_.second_frame_id);
+      options_dict["gauge_second_translation_dim"] =
+          gauge_selection_.second_translation_dim;
+      options_dict["gauge_baseline_norm"] =
+          gauge_selection_.baseline_norm;
+      options_dict["gauge_baseline_locked_component"] =
+          gauge_selection_.baseline_locked_component;
+      if (!gauge_selection_.point_indices.empty()) {
+        auto gauge_pt_arr = make_1d(gauge_selection_.point_indices.data(),
+                                    gauge_selection_.point_indices.size());
+        options_dict["gauge_point_indices"] = gauge_pt_arr;
+      } else {
+        options_dict["gauge_point_indices"] = py::array_t<int>();
+      }
 
       // Call the Python BAE solver.
       py::dict result = bae_solver.attr("solve")(extr_arr,
@@ -388,7 +418,23 @@ class BaeBundleAdjuster : public BundleAdjuster {
     double obs_y_centered = 0.0;
   };
 
+  struct GaugeSelection {
+    BundleAdjustmentGauge mode = BundleAdjustmentGauge::UNSPECIFIED;
+    bool already_fixed = false;
+    int anchor_image_idx = -1;
+    int second_image_idx = -1;
+    int second_translation_dim = -1;
+    image_t anchor_image_id = kInvalidImageId;
+    image_t second_image_id = kInvalidImageId;
+    frame_t anchor_frame_id = kInvalidFrameId;
+    frame_t second_frame_id = kInvalidFrameId;
+    double baseline_norm = 0.0;
+    double baseline_locked_component = 0.0;
+    std::vector<int> point_indices;
+  };
+
   void SetupProblem();
+  void SelectGaugeConstraints();
   static Eigen::Matrix3x4d MatrixFromFlatExtrinsic(const double* p);
   static Rigid3d Rigid3dFromPyPoseSe3Data(const double* p);
   void LogProbeResidualsFromArrays(const std::string& tag) const;
@@ -470,12 +516,16 @@ class BaeBundleAdjuster : public BundleAdjuster {
   std::vector<int> image_camera_idx_;
   // (num_images_): camera_id for each image (for intrinsics writeback).
   std::vector<camera_t> image_camera_ids_;
+  // (num_images_): image_id for each image pose row.
+  std::vector<image_t> image_image_ids_;
   // (num_images_): frame_id for each image pose row.
   std::vector<frame_t> image_frame_ids_;
   // (num_cameras_ * 2): [cx, cy] captured during extraction.
   std::vector<double> principal_points_;
   // Deterministic observation probes traced across Python/C++ boundaries.
   std::vector<ProbeObservation> probes_;
+  // Stationary gauge constraints selected to match COLMAP's Ceres policy.
+  GaugeSelection gauge_selection_;
 };
 
 void BaeBundleAdjuster::LogProbeSummary(
@@ -532,6 +582,257 @@ Rigid3d BaeBundleAdjuster::Rigid3dFromPyPoseSe3Data(const double* p) {
   Eigen::Quaterniond rotation(p[6], p[3], p[4], p[5]);
   rotation.normalize();
   return Rigid3d(rotation, translation);
+}
+
+void BaeBundleAdjuster::SelectGaugeConstraints() {
+  gauge_selection_ = GaugeSelection{};
+  gauge_selection_.mode = config_.FixedGauge();
+
+  if (!options_.refine_rig_from_world) {
+    LOG(INFO) << "[BAE gauge] pose refinement disabled; no extra gauge fix";
+    return;
+  }
+
+  if (gauge_selection_.mode == BundleAdjustmentGauge::UNSPECIFIED) {
+    LOG(INFO) << "[BAE gauge] unspecified; no extra gauge fix";
+    return;
+  }
+
+  auto maybe_add_fixed_point = [](const Eigen::Vector3d& xyz,
+                                  Eigen::Matrix3d* fixed_points,
+                                  Eigen::Index* num_fixed_points) {
+    if (*num_fixed_points >= 3) {
+      return false;
+    }
+    fixed_points->col(*num_fixed_points) = xyz;
+    if (fixed_points->colPivHouseholderQr().rank() > *num_fixed_points) {
+      ++(*num_fixed_points);
+      return true;
+    }
+    fixed_points->col(*num_fixed_points).setZero();
+    return false;
+  };
+
+  auto select_three_points = [&]() {
+    Eigen::Matrix3d fixed_points = Eigen::Matrix3d::Zero();
+    Eigen::Index num_fixed_points = 0;
+
+    for (const auto& [point3D_id, idx] : point3D_id_to_idx_) {
+      if (!constant_point_mask_[idx] ||
+          !reconstruction_.ExistsPoint3D(point3D_id)) {
+        continue;
+      }
+      const Point3D& point3D = reconstruction_.Point3D(point3D_id);
+      if (maybe_add_fixed_point(
+              point3D.xyz, &fixed_points, &num_fixed_points) &&
+          num_fixed_points >= 3) {
+        gauge_selection_.already_fixed = true;
+        gauge_selection_.point_indices.clear();
+        return;
+      }
+    }
+
+    gauge_selection_.point_indices.clear();
+    for (const auto& [point3D_id, idx] : point3D_id_to_idx_) {
+      if (constant_point_mask_[idx] ||
+          !reconstruction_.ExistsPoint3D(point3D_id)) {
+        continue;
+      }
+      const Point3D& point3D = reconstruction_.Point3D(point3D_id);
+      if (maybe_add_fixed_point(
+              point3D.xyz, &fixed_points, &num_fixed_points)) {
+        gauge_selection_.point_indices.push_back(static_cast<int>(idx));
+        if (num_fixed_points >= 3) {
+          return;
+        }
+      }
+    }
+
+    LOG(WARNING) << "[BAE gauge] failed to select three independent points; "
+                 << "num_fixed_points=" << num_fixed_points;
+    gauge_selection_.point_indices.clear();
+  };
+
+  if (gauge_selection_.mode == BundleAdjustmentGauge::THREE_POINTS) {
+    select_three_points();
+    LOG(INFO) << "[BAE gauge] mode=three_points already_fixed="
+              << gauge_selection_.already_fixed
+              << " selected_points=" << gauge_selection_.point_indices.size();
+    return;
+  }
+
+  THROW_CHECK_EQ(gauge_selection_.mode,
+                 BundleAdjustmentGauge::TWO_CAMS_FROM_WORLD);
+
+  auto is_parameterized_const_sensor = [&](const Image& image) {
+    const sensor_t sensor_id = image.CameraPtr()->SensorId();
+    if (image.FramePtr()->RigPtr()->IsRefSensor(sensor_id)) {
+      return true;
+    }
+    if (config_.HasConstantSensorFromRigPose(sensor_id) ||
+        !options_.refine_sensor_from_rig) {
+      return true;
+    }
+    return false;
+  };
+
+  Image* image1 = nullptr;
+  Image* image2 = nullptr;
+  int image1_idx = -1;
+  int image2_idx = -1;
+  int second_dim = -1;
+  Eigen::Vector3d selected_baseline = Eigen::Vector3d::Zero();
+
+  // Match Ceres: first search through already fixed images in the BA image set.
+  for (const image_t image_id : config_.Images()) {
+    auto idx_it = image_id_to_idx_.find(image_id);
+    if (idx_it == image_id_to_idx_.end()) {
+      continue;
+    }
+    if (!reconstruction_.ExistsImage(image_id)) {
+      continue;
+    }
+    Image& image = reconstruction_.Image(image_id);
+    if (config_.HasConstantRigFromWorldPose(image.FrameId()) &&
+        is_parameterized_const_sensor(image)) {
+      if (image1 == nullptr) {
+        image1 = &image;
+        image1_idx = static_cast<int>(idx_it->second);
+      } else if (image1->FrameId() != image.FrameId()) {
+        gauge_selection_.already_fixed = true;
+        gauge_selection_.anchor_image_idx = image1_idx;
+        gauge_selection_.anchor_image_id = image1->ImageId();
+        gauge_selection_.anchor_frame_id = image1->FrameId();
+        gauge_selection_.second_image_idx = static_cast<int>(idx_it->second);
+        gauge_selection_.second_image_id = image.ImageId();
+        gauge_selection_.second_frame_id = image.FrameId();
+        LOG(INFO) << "[BAE gauge] mode=two_cams_from_world already_fixed=true"
+                  << " image1_id=" << gauge_selection_.anchor_image_id
+                  << " image2_id=" << gauge_selection_.second_image_id
+                  << " frame1_id=" << gauge_selection_.anchor_frame_id
+                  << " frame2_id=" << gauge_selection_.second_frame_id;
+        return;
+      }
+    }
+  }
+
+  // Otherwise, search through variable images in the BA image set.
+  //
+  // Difference from Ceres: Ceres picks the first (image1, image2) pair with
+  // any nonzero baseline and breaks. For sequentially-captured datasets that
+  // pair is consecutive frames, with baseline often << 1% of scene radius;
+  // observed values include 0.028 (bridge), 0.0044 (barn). A microscopic
+  // locked baseline leaves the scale gauge effectively free, so PCG's
+  // per-component error along that direction lets sub-graphs drift to
+  // different metric scales — visible as intersecting planes in the point
+  // cloud and as low cross-backend RANSAC inlier ratios.
+  //
+  // To produce a strong, scale-pinning constraint we iterate over all
+  // (image1, image2) candidate pairs and pick the one with the largest
+  // baseline component. The locked dimension is the argmax component of
+  // that baseline, matching the Ceres SubsetManifold convention. Cost is
+  // O(N_const_sensor_imgs^2) — sub-second even on multi-thousand-image
+  // datasets.
+  struct Candidate {
+    Image* image;
+    int idx;
+  };
+  std::vector<Candidate> candidates;
+  candidates.reserve(num_images_);
+  for (const image_t image_id : config_.Images()) {
+    auto idx_it = image_id_to_idx_.find(image_id);
+    if (idx_it == image_id_to_idx_.end()) {
+      continue;
+    }
+    if (!reconstruction_.ExistsImage(image_id)) {
+      continue;
+    }
+    Image& image = reconstruction_.Image(image_id);
+    if (!is_parameterized_const_sensor(image)) {
+      continue;
+    }
+    candidates.push_back({&image, static_cast<int>(idx_it->second)});
+  }
+
+  double best_max_component = 0.0;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    Image* cand1 = candidates[i].image;
+    const int cand1_idx = candidates[i].idx;
+    for (size_t j = 0; j < candidates.size(); ++j) {
+      if (i == j) {
+        continue;
+      }
+      Image* cand2 = candidates[j].image;
+      const int cand2_idx = candidates[j].idx;
+      if (cand1->FrameId() == cand2->FrameId()) {
+        continue;
+      }
+      if (constant_pose_mask_[cand2_idx]) {
+        continue;
+      }
+      const Eigen::Vector3d baseline =
+          (cand1->FramePtr()->RigFromWorld() *
+           Inverse(cand2->FramePtr()->RigFromWorld()))
+              .translation();
+      Eigen::Index max_coeff_idx = 0;
+      const double max_component = baseline.cwiseAbs().maxCoeff(&max_coeff_idx);
+      if (max_component > best_max_component) {
+        best_max_component = max_component;
+        image1 = cand1;
+        image2 = cand2;
+        image1_idx = cand1_idx;
+        image2_idx = cand2_idx;
+        second_dim = static_cast<int>(max_coeff_idx);
+        selected_baseline = baseline;
+      }
+    }
+  }
+
+  if (best_max_component <= 1e-9) {
+    // No pair has a usable baseline; let the fallback below switch to
+    // THREE_POINTS gauge.
+    image1 = nullptr;
+    image2 = nullptr;
+    image1_idx = -1;
+    image2_idx = -1;
+    second_dim = -1;
+    selected_baseline = Eigen::Vector3d::Zero();
+  }
+
+  if (image1 == nullptr || image2 == nullptr || image1_idx < 0 ||
+      image2_idx < 0 || second_dim < 0) {
+    LOG(WARNING) << "[BAE gauge] failed to select two-camera gauge; "
+                    "falling back to three points";
+    gauge_selection_.mode = BundleAdjustmentGauge::THREE_POINTS;
+    select_three_points();
+    LOG(INFO) << "[BAE gauge] mode=three_points already_fixed="
+              << gauge_selection_.already_fixed
+              << " selected_points=" << gauge_selection_.point_indices.size();
+    return;
+  }
+
+  gauge_selection_.anchor_image_idx = image1_idx;
+  gauge_selection_.second_image_idx = image2_idx;
+  gauge_selection_.second_translation_dim = second_dim;
+  gauge_selection_.anchor_image_id = image1->ImageId();
+  gauge_selection_.second_image_id = image2->ImageId();
+  gauge_selection_.anchor_frame_id = image1->FrameId();
+  gauge_selection_.second_frame_id = image2->FrameId();
+  gauge_selection_.baseline_norm = selected_baseline.norm();
+  gauge_selection_.baseline_locked_component =
+      std::abs(selected_baseline[second_dim]);
+  LOG(INFO) << "[BAE gauge] mode=two_cams_from_world anchor_image_idx="
+            << gauge_selection_.anchor_image_idx
+            << " second_image_idx=" << gauge_selection_.second_image_idx
+            << " image1_id=" << gauge_selection_.anchor_image_id
+            << " image2_id=" << gauge_selection_.second_image_id
+            << " frame1_id=" << gauge_selection_.anchor_frame_id
+            << " frame2_id=" << gauge_selection_.second_frame_id
+            << " second_translation_dim="
+            << gauge_selection_.second_translation_dim
+            << " baseline_norm=" << gauge_selection_.baseline_norm
+            << " locked_component_abs="
+            << gauge_selection_.baseline_locked_component;
 }
 
 bool BaeBundleAdjuster::ComputeProbeProjectionFromArrays(
@@ -887,6 +1188,7 @@ void BaeBundleAdjuster::SetupProblem() {
   constant_pose_mask_.resize(num_images_, 0);
   image_camera_idx_.resize(num_images_);
   image_camera_ids_.resize(num_images_);
+  image_image_ids_.resize(num_images_);
   image_frame_ids_.resize(num_images_);
   principal_points_.assign(num_cameras_ * 2, 0.0);
 
@@ -921,6 +1223,7 @@ void BaeBundleAdjuster::SetupProblem() {
     const size_t cam_idx = camera_id_to_idx_.at(image.CameraId());
     image_camera_idx_[idx] = static_cast<int>(cam_idx);
     image_camera_ids_[idx] = image.CameraId();
+    image_image_ids_[idx] = image_id;
     image_frame_ids_[idx] = image.FrameId();
 
     // Intrinsics: [f, k1, k2] per unique camera (written once per camera).
@@ -1064,6 +1367,7 @@ void BaeBundleAdjuster::SetupProblem() {
         image_camera_idx_.push_back(
             static_cast<int>(camera_id_to_idx_.at(ext_cam_id)));
         image_camera_ids_.push_back(ext_cam_id);
+        image_image_ids_.push_back(track_el.image_id);
         image_frame_ids_.push_back(ext_image.FrameId());
       } else {
         ext_img_idx = img_it->second;
@@ -1086,6 +1390,72 @@ void BaeBundleAdjuster::SetupProblem() {
   for (const auto point3D_id : config_.ConstantPoints()) {
     add_external_obs(point3D_id);
   }
+
+  // Diagnostic: connected components of the view graph induced by
+  // shared 3D points. Two images are in the same component if they share
+  // at least one 3D point (i.e., a track passes through both). Multiple
+  // components mean the BA problem decomposes into independent sub-graphs
+  // joined only by gauge constraints. Multi-session captures (e.g.,
+  // mihama, kushimoto) typically present here as 2-N components with
+  // weak inter-session links.
+  if (num_images_ > 0 && num_observations_ > 0) {
+    std::vector<int> uf_parent(num_images_);
+    for (size_t i = 0; i < num_images_; ++i) uf_parent[i] = static_cast<int>(i);
+    auto uf_find = [&](int x) {
+      while (uf_parent[x] != x) {
+        uf_parent[x] = uf_parent[uf_parent[x]];
+        x = uf_parent[x];
+      }
+      return x;
+    };
+    auto uf_unite = [&](int a, int b) {
+      const int ra = uf_find(a);
+      const int rb = uf_find(b);
+      if (ra != rb) uf_parent[ra] = rb;
+    };
+    // Group observations by point index, then union all images touching
+    // each point. O(num_observations_) total work across both passes.
+    std::unordered_map<int, int> first_img_for_point;
+    first_img_for_point.reserve(num_points_);
+    for (size_t k = 0; k < num_observations_; ++k) {
+      const int pt = point_indices_[k];
+      const int img = image_indices_[k];
+      auto it = first_img_for_point.find(pt);
+      if (it == first_img_for_point.end()) {
+        first_img_for_point.emplace(pt, img);
+      } else {
+        uf_unite(it->second, img);
+      }
+    }
+    std::unordered_map<int, int> root_size;
+    root_size.reserve(num_images_);
+    for (size_t i = 0; i < num_images_; ++i) {
+      ++root_size[uf_find(static_cast<int>(i))];
+    }
+    std::vector<int> sizes;
+    sizes.reserve(root_size.size());
+    for (const auto& [_, c] : root_size) sizes.push_back(c);
+    std::sort(sizes.begin(), sizes.end(), std::greater<int>());
+    std::ostringstream ss;
+    ss << "[BAE view graph] components=" << sizes.size()
+       << " sizes=[";
+    const size_t n_show = std::min<size_t>(sizes.size(), 10);
+    for (size_t i = 0; i < n_show; ++i) {
+      if (i > 0) ss << ",";
+      ss << sizes[i];
+    }
+    if (sizes.size() > n_show) ss << ",...";
+    ss << "] total_images=" << num_images_;
+    if (sizes.size() > 1) {
+      const double largest_frac =
+          static_cast<double>(sizes[0]) / static_cast<double>(num_images_);
+      ss << " largest_component_frac=" << std::fixed << std::setprecision(3)
+         << largest_frac;
+    }
+    LOG(INFO) << ss.str();
+  }
+
+  SelectGaugeConstraints();
 
   LOG(INFO) << "BAE extraction: " << num_images_ << " images, "
             << num_cameras_ << " cameras, "

@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace colmap {
@@ -97,6 +98,95 @@ void LogReprojectionResiduals(const Reconstruction& reconstruction,
             << "  (filter=1.00e-02)";
 }
 
+// Bucketing for track-length diagnostics: tracks of length L go into one
+// of 7 buckets so the per-bucket drop rate is greppable.
+//   0: exactly 2 obs (degenerate)
+//   1: exactly 3 obs (just above min for a stable triangulation)
+//   2: 4-5
+//   3: 6-10
+//   4: 11-20
+//   5: 21-50
+//   6: 50+ (long cross-region tracks)
+inline int TrackLenBucketIdx(int len) {
+  if (len <= 2) return 0;
+  if (len == 3) return 1;
+  if (len <= 5) return 2;
+  if (len <= 10) return 3;
+  if (len <= 20) return 4;
+  if (len <= 50) return 5;
+  return 6;
+}
+
+constexpr std::array<const char*, 7> kTrackLenBucketLabels{
+    "2", "3", "4-5", "6-10", "11-20", "21-50", "50+"};
+
+// Snapshot the track length of every current 3D point in the
+// reconstruction.  Used to compute filter rate by bucket below.
+std::unordered_map<point3D_t, int> SnapshotTrackLengths(
+    const Reconstruction& reconstruction) {
+  std::unordered_map<point3D_t, int> snap;
+  snap.reserve(reconstruction.NumPoints3D());
+  for (const auto& [pid, point3D] : reconstruction.Points3D()) {
+    snap.emplace(pid, static_cast<int>(point3D.track.Length()));
+  }
+  return snap;
+}
+
+// Diagnostic: of the points that existed *before* the wrapped filter
+// operation, how many in each track-length bucket survived?
+//
+// This answers the question raised by the kushimoto run: is the retri
+// filter dropping long cross-region tracks (the consistency evidence
+// that ties sub-regions together) or is it only dropping short noisy
+// ones?  If the 11-20 / 21-50 / 50+ buckets show drop rates comparable
+// to or higher than the 3-bucket, the filter is removing cross-region
+// constraints — and that explains "intersecting planes" symptoms even
+// when bulk metrics look ok.
+void LogFilterRateByTrackLength(
+    const std::unordered_map<point3D_t, int>& before_snap,
+    const Reconstruction& reconstruction_after,
+    const std::string& tag) {
+  std::array<size_t, 7> total{};
+  std::array<size_t, 7> survived{};
+  for (const auto& [pid, len_before] : before_snap) {
+    const int idx = TrackLenBucketIdx(len_before);
+    ++total[idx];
+    if (reconstruction_after.ExistsPoint3D(pid)) {
+      ++survived[idx];
+    }
+  }
+  size_t total_all = 0;
+  size_t survived_all = 0;
+  for (size_t i = 0; i < total.size(); ++i) {
+    total_all += total[i];
+    survived_all += survived[i];
+  }
+  std::ostringstream ss;
+  ss << "[filter-rate " << tag << "] dropped="
+     << (total_all - survived_all) << "/" << total_all;
+  if (total_all > 0) {
+    ss << " ("
+       << std::fixed << std::setprecision(1)
+       << (100.0 * static_cast<double>(total_all - survived_all) /
+           static_cast<double>(total_all))
+       << "%)";
+  }
+  ss << " kept_pct_by_track_len:";
+  for (size_t i = 0; i < kTrackLenBucketLabels.size(); ++i) {
+    ss << " " << kTrackLenBucketLabels[i] << "=";
+    if (total[i] == 0) {
+      ss << "na";
+    } else {
+      const double kept_pct =
+          100.0 * static_cast<double>(survived[i]) /
+          static_cast<double>(total[i]);
+      ss << std::fixed << std::setprecision(1) << kept_pct << "%"
+         << "(" << survived[i] << "/" << total[i] << ")";
+    }
+  }
+  LOG(INFO) << ss.str();
+}
+
 bool RunBundleAdjustment(const BundleAdjustmentOptions& options,
                          Reconstruction& reconstruction) {
   if (reconstruction.NumImages() == 0) {
@@ -119,6 +209,41 @@ bool RunBundleAdjustment(const BundleAdjustmentOptions& options,
   auto ba = CreateDefaultBundleAdjuster(options, ba_config, reconstruction);
 
   return ba->Solve()->IsSolutionUsable();
+}
+
+bool RunPreRetriangulationBaePolish(const BundleAdjustmentOptions& options,
+                                    Reconstruction& reconstruction) {
+  if (options.backend != BundleAdjustmentBackend::BAE || !options.bae) {
+    return true;
+  }
+
+  LOG(INFO) << "Running BAE-only pre-retriangulation polish";
+  LogReprojectionResiduals(reconstruction, "pre_retri.camera_only.start");
+
+  // Freeze structure first so BAE can spend its step quality budget on the
+  // camera state that retriangulation depends on most.
+  BundleAdjustmentOptions camera_only_options = options;
+  camera_only_options.refine_points3D = false;
+  camera_only_options.print_summary = true;
+  camera_only_options.bae->max_num_iterations =
+      std::min(camera_only_options.bae->max_num_iterations, 50);
+  if (!RunBundleAdjustment(camera_only_options, reconstruction)) {
+    return false;
+  }
+  LogReprojectionResiduals(reconstruction, "pre_retri.camera_only.done");
+
+  // Follow with a short joint pass so the polished cameras can pull the
+  // existing structure into better agreement before the destructive retri.
+  BundleAdjustmentOptions joint_options = options;
+  joint_options.print_summary = true;
+  joint_options.bae->max_num_iterations =
+      std::min(joint_options.bae->max_num_iterations, 30);
+  if (!RunBundleAdjustment(joint_options, reconstruction)) {
+    return false;
+  }
+  LogReprojectionResiduals(reconstruction, "pre_retri.joint.done");
+
+  return true;
 }
 
 GlobalMapperOptions InitializeOptions(const GlobalMapperOptions& options) {
@@ -440,6 +565,7 @@ bool GlobalMapper::IterativeBundleAdjustment(
     // adjustment right away. Instead, use a more strict criteria to filter
     LOG(INFO) << "Filtering tracks by reprojection ...";
 
+    auto before_iter_filter_loop = SnapshotTrackLengths(*reconstruction_);
     ObservationManager obs_manager(*reconstruction_);
     bool status = true;
     size_t filtered_num = 0;
@@ -456,6 +582,9 @@ bool GlobalMapper::IterativeBundleAdjustment(
         ite++;
       }
     }
+    LogFilterRateByTrackLength(before_iter_filter_loop, *reconstruction_,
+                               "iter_ba.iter" + std::to_string(ite + 1) +
+                                   ".scaling_filter_loop");
     if (status) {
       LOG(INFO) << "fewer than 0.1% tracks are filtered, stop the iteration.";
       break;
@@ -465,6 +594,7 @@ bool GlobalMapper::IterativeBundleAdjustment(
   // Filter tracks based on the estimation
   LOG(INFO) << "Filtering tracks by reprojection ...";
   {
+    auto before_iter_ba_final_filter = SnapshotTrackLengths(*reconstruction_);
     ObservationManager obs_manager(*reconstruction_);
     obs_manager.FilterPoints3DWithLargeReprojectionError(
         max_normalized_reproj_error,
@@ -472,6 +602,8 @@ bool GlobalMapper::IterativeBundleAdjustment(
         ReprojectionErrorType::NORMALIZED);
     obs_manager.FilterPoints3DWithSmallTriangulationAngle(
         min_tri_angle_deg, reconstruction_->Point3DIds());
+    LogFilterRateByTrackLength(before_iter_ba_final_filter, *reconstruction_,
+                               "iter_ba.final_filter");
   }
   // Final post-iter_BA residual distribution (after all BA + final filter).
   LogReprojectionResiduals(*reconstruction_, "iter_ba.final");
@@ -484,6 +616,10 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
     const BundleAdjustmentOptions& ba_options,
     double max_normalized_reproj_error,
     double min_tri_angle_deg) {
+  if (!RunPreRetriangulationBaePolish(ba_options, *reconstruction_)) {
+    return false;
+  }
+
   // Delete all existing 3D points and re-establish 2D-3D correspondences.
   reconstruction_->DeleteAllPoints2DAndPoints3D();
 
@@ -529,6 +665,14 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // 3 retri-refinement rounds matches the 3-round outer iterative-BA
   // schedule above, giving symmetric BA effort across the two stages.
   // Applies to both backends (Ceres and BAE) — they share this call.
+  //
+  // Snapshot track lengths before IterativeGlobalRefinement so we can
+  // measure which buckets get filtered inside its 3-round filter+BA
+  // loop. This is the highest-impact filter pass in the whole
+  // pipeline; on kushimoto it drops ~60% of post-tri observations and
+  // appears to be the most likely cause of cross-region track loss
+  // ("intersecting planes" symptom).
+  auto before_refinement_loop = SnapshotTrackLengths(*reconstruction_);
   mapper.IterativeGlobalRefinement(/*max_num_refinements=*/3,
                                    /*max_refinement_change=*/0.0005,
                                    mapper_options,
@@ -540,15 +684,20 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // or Ceres, depending on custom_ba_options.backend) achieved on the
   // re-triangulated tracks.
   LogReprojectionResiduals(*reconstruction_, "retri.refinement_done");
+  LogFilterRateByTrackLength(before_refinement_loop, *reconstruction_,
+                             "retri.refinement_loop");
 
   mapper.EndReconstruction(/*discard=*/false);
 
   // Final filtering and bundle adjustment.
+  auto before_pre_final_ba_filter = SnapshotTrackLengths(*reconstruction_);
   ObservationManager obs_manager(*reconstruction_);
   obs_manager.FilterPoints3DWithLargeReprojectionError(
       max_normalized_reproj_error,
       reconstruction_->Point3DIds(),
       ReprojectionErrorType::NORMALIZED);
+  LogFilterRateByTrackLength(before_pre_final_ba_filter, *reconstruction_,
+                             "retri.pre_final_ba_filter");
 
   if (!RunBundleAdjustment(ba_options, *reconstruction_)) {
     return false;
@@ -563,12 +712,15 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // incremental mapper's !use_prior_position condition).
   reconstruction_->Normalize();
 
+  auto before_retri_final_filter = SnapshotTrackLengths(*reconstruction_);
   obs_manager.FilterPoints3DWithLargeReprojectionError(
       max_normalized_reproj_error,
       reconstruction_->Point3DIds(),
       ReprojectionErrorType::NORMALIZED);
   obs_manager.FilterPoints3DWithSmallTriangulationAngle(
       min_tri_angle_deg, reconstruction_->Point3DIds());
+  LogFilterRateByTrackLength(before_retri_final_filter, *reconstruction_,
+                             "retri.final_filter");
   // Final post-pipeline residual snapshot.  By construction this should
   // be at or below the COLMAP filter threshold (1e-2 normalized) for
   // every kept observation.

@@ -43,6 +43,121 @@ def _log(msg):
         pass
 
 
+def _env_float(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+_FULL_BA_SOLVE_COUNT = 0
+_SE3_TANGENT_DIAG_LOGGED = False
+
+
+def _make_trust_region_strategy(constant_rotation):
+    global _FULL_BA_SOLVE_COUNT
+
+    if constant_rotation:
+        radius = _env_float("COLMAP_BAE_FIXED_ROT_RADIUS", 1e4)
+        max_radius = _env_float("COLMAP_BAE_FIXED_ROT_MAX_RADIUS", 1e10)
+        up = _env_float("COLMAP_BAE_FIXED_ROT_TR_UP", 2.0)
+        down = _env_float("COLMAP_BAE_FIXED_ROT_TR_DOWN", 0.5**4)
+        _log(
+            "trust-region fixed_rot: "
+            f"radius={radius:.3e} max={max_radius:.3e} "
+            f"up={up:.3e} down={down:.3e}"
+        )
+        return pp.optim.strategy.TrustRegion(
+            radius=radius, max=max_radius, up=up, down=down
+        )
+
+    solve_idx = _FULL_BA_SOLVE_COUNT
+    _FULL_BA_SOLVE_COUNT += 1
+    apply_overrides = True
+    if _env_bool("COLMAP_BAE_FULL_BA_OVERRIDE_FIRST_ONLY", False):
+        apply_overrides = solve_idx == 0
+
+    default_radius = 0.3
+    default_min_radius = 1e-6
+    default_max_radius = 1e10
+    default_up = 2.0
+    default_down = 0.5
+
+    if apply_overrides:
+        radius = _env_float("COLMAP_BAE_FULL_BA_RADIUS", default_radius)
+        min_radius = _env_float(
+            "COLMAP_BAE_FULL_BA_MIN_RADIUS", default_min_radius
+        )
+        max_radius = _env_float(
+            "COLMAP_BAE_FULL_BA_MAX_RADIUS", default_max_radius
+        )
+        up = _env_float("COLMAP_BAE_FULL_BA_TR_UP", default_up)
+        down = _env_float("COLMAP_BAE_FULL_BA_TR_DOWN", default_down)
+    else:
+        radius = default_radius
+        min_radius = default_min_radius
+        max_radius = default_max_radius
+        up = default_up
+        down = default_down
+
+    _log(
+        "trust-region full_ba: "
+        f"solve_idx={solve_idx} apply_overrides={apply_overrides} "
+        f"radius={radius:.3e} min={min_radius:.3e} max={max_radius:.3e} "
+        f"up={up:.3e} down={down:.3e}"
+    )
+    return pp.optim.strategy.TrustRegion(
+        radius=radius, min=min_radius, max=max_radius, up=up, down=down
+    )
+
+
+def _log_se3_tangent_layout_once():
+    """Log which pp.se3 tangent coordinates move translation vs rotation.
+
+    The stationary gauge fix freezes tangent-space DoFs, so we want a
+    ground-truth log of which tangent indices correspond to translation
+    in the specific PyPose build we're running against.
+    """
+    global _SE3_TANGENT_DIAG_LOGGED
+    if _SE3_TANGENT_DIAG_LOGGED:
+        return
+    _SE3_TANGENT_DIAG_LOGGED = True
+
+    eps = 1e-4
+    base = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]],
+                        dtype=torch.float64)
+    lines = []
+    for i in range(6):
+        step = torch.zeros((1, 6), dtype=torch.float64)
+        step[0, i] = eps
+        moved = pp.SE3(base.clone()).add_(pp.se3(step))
+        matrix = moved.matrix()[0, :3, :]
+        translation = matrix[:, 3].cpu().numpy()
+        rotation = matrix[:, :3].cpu().numpy()
+        trace = float(np.trace(rotation))
+        cos_theta = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+        rot_deg = float(np.degrees(np.arccos(cos_theta)))
+        lines.append(
+            f"d{i}: t=[{translation[0]:+.3e}, {translation[1]:+.3e}, "
+            f"{translation[2]:+.3e}] rot_deg={rot_deg:.3e}"
+        )
+    _log("se3 tangent layout: " + " | ".join(lines))
+
+
 def _distort_and_project(points_cam, intrinsics):
     """Perspective divide + SIMPLE_RADIAL distortion + focal scaling."""
     points_proj = points_cam[..., :2] / points_cam[..., 2].unsqueeze(-1)
@@ -553,9 +668,194 @@ def _split_step_vector(step, numels):
     return splits
 
 
-def _log_lm_iteration_stats(tag, J_blocks, residual, step_vec, params):
-    numels = _parameter_block_numels(params)
-    step_blocks = _split_step_vector(step_vec, numels)
+def _build_compact_constraint_masks(
+    ig_n2o,
+    cm_n2o,
+    pt_n2o,
+    constant_pose_mask_np,
+    constant_point_mask_np,
+    refine_focal_length,
+    refine_extra_params,
+    constant_rotation,
+    options_dict,
+):
+    pose_dofs_per_img = 3 if constant_rotation else 6
+    pose_active = np.ones(len(ig_n2o) * pose_dofs_per_img, dtype=bool)
+    intr_active = np.ones(len(cm_n2o) * 2, dtype=bool)
+    point_active = np.ones(len(pt_n2o) * 3, dtype=bool)
+
+    compact_img_map = {
+        int(orig_idx): int(local_idx) for local_idx, orig_idx in enumerate(ig_n2o)
+    }
+    compact_pt_map = {
+        int(orig_idx): int(local_idx) for local_idx, orig_idx in enumerate(pt_n2o)
+    }
+
+    compact_const_pose = constant_pose_mask_np[np.asarray(ig_n2o, dtype=np.int64)]
+    for local_idx, is_const in enumerate(compact_const_pose.astype(bool)):
+        if not is_const:
+            continue
+        start = local_idx * pose_dofs_per_img
+        pose_active[start:start + pose_dofs_per_img] = False
+
+    compact_const_point = constant_point_mask_np[np.asarray(pt_n2o, dtype=np.int64)]
+    for local_idx, is_const in enumerate(compact_const_point.astype(bool)):
+        if not is_const:
+            continue
+        start = local_idx * 3
+        point_active[start:start + 3] = False
+
+    if not refine_focal_length:
+        intr_active[0::2] = False
+    if not refine_extra_params:
+        intr_active[1::2] = False
+
+    gauge_mode = options_dict.get("gauge_mode", "none")
+    gauge_already_fixed = bool(options_dict.get("gauge_already_fixed", False))
+    gauge_summary = [f"mode={gauge_mode}"]
+
+    if gauge_already_fixed:
+        gauge_summary.append("already_fixed=True")
+        _log("gauge constraints: " + " ".join(gauge_summary))
+        return {
+            "pose_active": pose_active,
+            "intr_active": intr_active,
+            "point_active": point_active,
+        }
+
+    gauge_mode_norm = str(gauge_mode).strip().lower()
+
+    if gauge_mode_norm == "two_cams_from_world":
+        anchor_img_orig = int(options_dict.get("gauge_anchor_image_idx", -1))
+        second_img_orig = int(options_dict.get("gauge_second_image_idx", -1))
+        anchor_image_id = int(options_dict.get("gauge_anchor_image_id", -1))
+        second_image_id = int(options_dict.get("gauge_second_image_id", -1))
+        anchor_frame_id = int(options_dict.get("gauge_anchor_frame_id", -1))
+        second_frame_id = int(options_dict.get("gauge_second_frame_id", -1))
+        second_dim = int(options_dict.get("gauge_second_translation_dim", -1))
+        baseline_norm = float(options_dict.get("gauge_baseline_norm", 0.0))
+        baseline_locked_component = float(
+            options_dict.get("gauge_baseline_locked_component", 0.0)
+        )
+
+        anchor_local = compact_img_map.get(anchor_img_orig, -1)
+        if anchor_local >= 0:
+            start = anchor_local * pose_dofs_per_img
+            pose_active[start:start + pose_dofs_per_img] = False
+            gauge_summary.append(
+                f"anchor_img_orig={anchor_img_orig} anchor_local={anchor_local} "
+                f"anchor_image_id={anchor_image_id} anchor_frame_id={anchor_frame_id}"
+            )
+        else:
+            gauge_summary.append(
+                f"anchor_img_orig={anchor_img_orig} anchor_local=skip "
+                f"anchor_image_id={anchor_image_id} anchor_frame_id={anchor_frame_id}"
+            )
+
+        second_local = compact_img_map.get(second_img_orig, -1)
+        if second_local >= 0 and 0 <= second_dim < 3:
+            pose_active[second_local * pose_dofs_per_img + second_dim] = False
+            gauge_summary.append(
+                f"second_img_orig={second_img_orig} second_local={second_local} "
+                f"second_image_id={second_image_id} second_frame_id={second_frame_id} "
+                f"fixed_t_dim={second_dim} baseline_norm={baseline_norm:.6g} "
+                f"locked_component_abs={baseline_locked_component:.6g}"
+            )
+        else:
+            gauge_summary.append(
+                f"second_img_orig={second_img_orig} second_local=skip "
+                f"second_image_id={second_image_id} second_frame_id={second_frame_id} "
+                f"fixed_t_dim={second_dim} baseline_norm={baseline_norm:.6g} "
+                f"locked_component_abs={baseline_locked_component:.6g}"
+            )
+    elif gauge_mode_norm == "three_points":
+        point_indices = np.asarray(
+            options_dict.get("gauge_point_indices", []), dtype=np.int64
+        )
+        fixed_local = []
+        for point_orig in point_indices.tolist():
+            point_local = compact_pt_map.get(int(point_orig), -1)
+            if point_local >= 0:
+                start = point_local * 3
+                point_active[start:start + 3] = False
+                fixed_local.append(point_local)
+        gauge_summary.append(
+            f"fixed_points_orig={point_indices.tolist()} fixed_points_local={fixed_local}"
+        )
+    else:
+        gauge_summary.append("no_extra_gauge_constraints")
+
+    _log("gauge constraints: " + " ".join(gauge_summary))
+
+    return {
+        "pose_active": pose_active,
+        "intr_active": intr_active,
+        "point_active": point_active,
+    }
+
+
+def _compress_sparse_block_columns(block, active_mask):
+    active_mask = torch.as_tensor(
+        active_mask, dtype=torch.bool, device=block.device).reshape(-1)
+    ncols = int(block.shape[1])
+    if active_mask.numel() != ncols:
+        raise ValueError(
+            f"Active-mask length {active_mask.numel()} != block cols {ncols}"
+        )
+    active_count = int(active_mask.sum().item())
+    if active_count == ncols:
+        return block.coalesce(), active_mask, None
+
+    block = block.coalesce()
+    indices = block.indices()
+    rows = indices[0]
+    cols = indices[1]
+    keep_nz = active_mask[cols]
+    if keep_nz.any():
+        active_pos = torch.cumsum(active_mask.to(torch.int64), dim=0) - 1
+        new_cols = active_pos[cols[keep_nz]]
+        new_indices = torch.stack([rows[keep_nz], new_cols])
+        new_values = block.values()[keep_nz]
+    else:
+        new_indices = torch.empty(
+            (2, 0), dtype=torch.long, device=block.device)
+        new_values = torch.empty(
+            (0,), dtype=block.values().dtype, device=block.device)
+    compressed = torch.sparse_coo_tensor(
+        new_indices,
+        new_values,
+        (block.shape[0], active_count),
+        device=block.device,
+        dtype=block.dtype,
+    ).coalesce()
+    return compressed, active_mask, active_count
+
+
+def _expand_step_blocks_to_full(step_blocks_reduced, block_specs):
+    expanded = []
+    for step_block, spec in zip(step_blocks_reduced, block_specs):
+        active_mask = spec["active_mask"]
+        full_numel = int(active_mask.numel())
+        full_block = torch.zeros(
+            full_numel, dtype=step_block.dtype, device=step_block.device)
+        if spec["active_count"] > 0:
+            full_block[active_mask] = step_block.reshape(-1)
+        expanded.append(full_block)
+    return expanded
+
+
+def _cat_sparse_blocks(blocks):
+    if len(blocks) == 1:
+        return blocks[0].coalesce()
+    return torch.cat([block.coalesce() for block in blocks], dim=-1).coalesce()
+
+
+def _log_lm_iteration_stats(
+    tag, J_blocks, residual, step_vec, params, block_numels=None
+):
+    if block_numels is None:
+        block_numels = _parameter_block_numels(params)
+    step_blocks = _split_step_vector(step_vec, block_numels)
     residual_col = residual.view(-1, 1)
     rhs_blocks = []
     for block in J_blocks:
@@ -579,7 +879,36 @@ def _log_lm_iteration_stats(tag, J_blocks, residual, step_vec, params):
     _log(f"{tag} " + "  ".join(summaries))
 
 
-def _compute_quality(J_blocks, D_blocks, residual, last_loss, new_loss):
+def _log_jtj_diag_stats(tag, J_blocks, params):
+    if len(params) == 3:
+        labels = ["pose", "intr", "points"]
+    else:
+        labels = [f"block{i}" for i in range(len(params))]
+
+    summaries = []
+    for label, block in zip(labels, J_blocks):
+        block = block.coalesce()
+        if block.shape[1] == 0 or block._nnz() == 0:
+            summaries.append(f"{label}:diag(JTJ)=empty")
+            continue
+        cols = block.indices()[1]
+        vals = block.values()
+        diag = torch.zeros(
+            block.shape[1], dtype=vals.dtype, device=vals.device
+        )
+        diag.scatter_add_(0, cols, vals * vals)
+        diag_np = diag.detach().cpu().numpy()
+        summaries.append(
+            f"{label}:diag(JTJ)"
+            f"[p10={np.percentile(diag_np, 10):.3e}"
+            f" p50={np.percentile(diag_np, 50):.3e}"
+            f" p90={np.percentile(diag_np, 90):.3e}"
+            f" max={np.max(diag_np):.3e}]"
+        )
+    _log(f"{tag} " + "  ".join(summaries))
+
+
+def _compute_quality_terms(J_blocks, D_blocks, residual, last_loss, new_loss):
     jd = None
     for block, d_block in zip(J_blocks, D_blocks):
         contrib = block.to_sparse_coo() @ d_block.reshape(-1, 1)
@@ -587,9 +916,16 @@ def _compute_quality(J_blocks, D_blocks, residual, last_loss, new_loss):
     residual_col = residual.reshape(-1, 1)
     denom = -(jd.mT @ (2 * residual_col + jd)).reshape(())
     denom_val = float(denom.item()) if torch.is_tensor(denom) else float(denom)
+    actual_reduction = float(last_loss - new_loss)
     if abs(denom_val) < 1e-20:
-        return float("nan")
-    return float((last_loss - new_loss) / denom_val)
+        quality = float("nan")
+    else:
+        quality = float(actual_reduction / denom_val)
+    return {
+        "actual_reduction": actual_reduction,
+        "predicted_reduction": denom_val,
+        "quality": quality,
+    }
 
 
 def _compute_column_scaling(
@@ -620,11 +956,78 @@ def _extrinsics_matrices_to_se3_data_numpy(extrinsics_np):
     return np.ascontiguousarray(se3.data.cpu().numpy())
 
 
+def _huber_rho_and_weight(s, delta):
+    """Per-observation Huber rho(s) and sqrt-of-derivative weight.
+
+    s: (N,) squared residual norms.
+    delta: Huber threshold.
+
+    Returns rho_per_obs (N,) and weight (N,):
+      inlier  s <= delta^2: rho = s,                weight = 1
+      outlier s >  delta^2: rho = 2*delta*sqrt(s) - delta^2,
+                            weight = sqrt(delta / sqrt(s))
+    """
+    d2 = delta * delta
+    inlier = s <= d2
+    sqrt_s = torch.sqrt(torch.clamp(s, min=1e-30))
+    rho_per_obs = torch.where(inlier, s, 2.0 * delta * sqrt_s - d2)
+    rho_prime = torch.where(inlier, torch.ones_like(s), delta / sqrt_s)
+    weight = torch.sqrt(rho_prime)
+    return rho_per_obs, weight
+
+
+def _apply_huber_correction(residual_2d, j_blocks, delta):
+    """Triggs FastTriggs (square-rooted kernel) correction for (R, J).
+
+    The bae library's `LM.step()` silently drops the configured robust
+    kernel when assembling the GN normal equations: raw R and J flow
+    into PCG unweighted. On bridge, kushimoto, mihama (residuals span
+    1–10 px) this makes the L2 step target outlier reduction while
+    the inlier p50 stays flat. Applying the IRLS reweighting Ceres
+    uses internally for HuberLoss to (R, J) — *not* to the model.loss
+    used for accept/reject, which pypose's RobustModel wrapper already
+    handles kernel-side — fixes the step direction. See info.md §3.31.
+
+    Args:
+        residual_2d: (N, 2) 2D reprojection residuals.
+        j_blocks: list of sparse COO Jacobians, each (2N, n_dofs_block).
+        delta: Huber threshold.
+
+    Returns:
+        residual_weighted: (N, 2) — kernel-weighted residual.
+        j_blocks_weighted: list of sparse COO — kernel-weighted Jacobians.
+    """
+    s = (residual_2d * residual_2d).sum(dim=-1)  # (N,)
+    _, w = _huber_rho_and_weight(s, delta)
+
+    residual_weighted = residual_2d * w.unsqueeze(-1)  # (N, 2)
+
+    # Each 2D residual r_i corresponds to two rows of J (rows 2i, 2i+1).
+    # Both rows get the same weight w_i.
+    w_per_row = w.unsqueeze(-1).expand(-1, 2).reshape(-1)  # (2N,)
+    j_blocks_weighted = []
+    for j in j_blocks:
+        j = j.coalesce()
+        rows = j.indices()[0]
+        scaled_values = j.values() * w_per_row[rows]
+        j_weighted = torch.sparse_coo_tensor(
+            j.indices(),
+            scaled_values,
+            j.shape,
+            device=j.device,
+            dtype=j.dtype,
+        ).coalesce()
+        j_blocks_weighted.append(j_weighted)
+
+    return residual_weighted, j_blocks_weighted
+
+
 def solve(
     extrinsics_np, intrinsics_np, points_3d_np, points_2d_np,
     image_indices_np, camera_indices_np, point_indices_np,
     constant_pose_mask_np, constant_point_mask_np, options_dict,
 ):
+    _log_se3_tangent_layout_once()
     if not torch.cuda.is_available():
         raise RuntimeError("BAE requires CUDA")
     gpu_index = options_dict.get("gpu_index", "0")
@@ -841,7 +1244,18 @@ def solve(
             f"const_rot={constant_rotation}"
         )
         if n_o == 0:
-            return None, None, None, (ig_n2o, cm_n2o, pt_n2o)
+            return (
+                None,
+                None,
+                None,
+                (ig_n2o, cm_n2o, pt_n2o),
+                {
+                    "pose_active": np.zeros(
+                        n_i * (3 if constant_rotation else 6), dtype=bool),
+                    "intr_active": np.zeros(n_c * 2, dtype=bool),
+                    "point_active": np.zeros(n_p * 3, dtype=bool),
+                },
+            )
 
         # Build the optimizer's intrinsics as a 2-column tensor (f, k1)
         # for SIMPLE_RADIAL.  The C++-side buffer is 3-wide for forward
@@ -869,40 +1283,59 @@ def solve(
             inp = {"points_2d": p2_t, "image_indices": ii_t,
                    "camera_indices": ci_t, "point_indices": pi_t,
                    "rotations": ro_t}
-            # Fixed-rotation BA has been stable with a large trust-region
-            # radius / low initial damping.
-            strat = pp.optim.strategy.TrustRegion(
-                radius=1e4, max=1e10, up=2.0, down=0.5**4)
         else:
             ex_t = pp.mat2SE3(
                 torch.tensor(ext_c, dtype=torch.float64, device=device))
             mdl = ColmapReproj(ex_t, intr_t, p3_t).to(device)
             inp = {"points_2d": p2_t, "image_indices": ii_t,
                    "camera_indices": ci_t, "point_indices": pi_t}
-            # Full BA's first joint step is consistently over-aggressive:
-            # the logs show several catastrophic rejects before damping
-            # reaches ~3.3 and the step becomes acceptable. Start closer to
-            # that regime and adapt less violently than the default schedule.
-            strat = pp.optim.strategy.TrustRegion(
-                radius=0.3, min=1e-6, max=1e10, up=2.0, down=0.5)
+        constraint_masks = _build_compact_constraint_masks(
+            ig_n2o,
+            cm_n2o,
+            pt_n2o,
+            constant_pose_mask_np,
+            constant_point_mask_np,
+            refine_focal_length,
+            refine_extra_params,
+            constant_rotation,
+            options_dict,
+        )
+
+        strat = _make_trust_region_strategy(constant_rotation)
         # Wrap PCG so each LM normal-equation solve emits its achieved
         # |Ax - b| / |b|.  See `_LoggingPCG` for rationale.
         slvr = _LoggingPCG(PCG(tol=1e-5))
         kernel = Huber(delta=kernel_delta)
-        opt = LM(mdl, strategy=strat, solver=slvr, kernel=kernel, reject=30)
-        return mdl, opt, inp, (ig_n2o, cm_n2o, pt_n2o)
+        reject_cap = _env_int("COLMAP_BAE_LM_REJECT_CAP", 30)
+        _log(f"lm reject cap: {reject_cap}")
+        opt = LM(
+            mdl, strategy=strat, solver=slvr, kernel=kernel, reject=reject_cap
+        )
+        return mdl, opt, inp, (ig_n2o, cm_n2o, pt_n2o), constraint_masks
 
     # ------------------------------------------------------------------
     # Helper: run one round of LM optimisation (InstantSFM convergence).
     # ------------------------------------------------------------------
-    def _run_ba(mdl, opt, inp, max_iters):
+    def _run_ba(mdl, opt, inp, max_iters, constraint_masks):
         window_size = 4
-        func_tol = 5e-4
+        # Tightened 5e-4 -> 5e-5: on kushimoto every BA call exited at 8-18
+        # iters via the previous threshold with cost still descending at
+        # ~3-5e-4 per window, while Ceres on the same input kept descending
+        # for ~3 more orders of magnitude in cost. Bridge was iter-cap-bound
+        # so this change is a no-op there; kushimoto/mihama benefit. See
+        # info.md §3.31 / kushimoto run analysis.
+        func_tol = 5e-5
         loss_hist = []
         n_it = 0
+        accepted_tiny_streak = 0
+        tiny_step_norm_thresh = 1e-5
+        tiny_step_max_thresh = 1e-6
+        low_quality_thresh = 1e-2
+        damping_saturation_thresh = 1e4
 
         @torch.no_grad()
         def _debug_step():
+            nonlocal accepted_tiny_streak
             for pg in opt.param_groups:
                 residual = list(opt.model(inp))[0]
                 j_blocks = jacobian(residual, pg["params"])
@@ -910,9 +1343,56 @@ def solve(
                     residual = residual.tensor()
                 residual = residual.detach()
                 j_blocks = [j.detach().to_sparse_coo() for j in j_blocks]
-                J_coo_unscaled = torch.cat(j_blocks, dim=-1).coalesce()
+                # Apply Triggs FastTriggs (square-rooted Huber) correction to
+                # (R, J). The bae library's `LM.step()` drops the kernel
+                # when assembling J^T J and J^T r for the PCG solve;
+                # without this the GN step descends pure L2 and outlier-
+                # heavy datasets stall (info.md §3.31). The `model.loss`
+                # used for accept/reject is already kerneled via pypose's
+                # `RobustModel` wrapper, so we only need to weight R and J.
+                residual, j_blocks = _apply_huber_correction(
+                    residual, j_blocks, kernel_delta
+                )
+                raw_block_masks = [
+                    constraint_masks["pose_active"],
+                    constraint_masks["intr_active"],
+                    constraint_masks["point_active"],
+                ]
+                compressed_blocks = []
+                block_specs = []
+                for block, active_mask_np in zip(j_blocks, raw_block_masks):
+                    active_mask = torch.as_tensor(
+                        active_mask_np, dtype=torch.bool, device=block.device)
+                    compressed_block, active_mask, active_count = (
+                        _compress_sparse_block_columns(block, active_mask)
+                    )
+                    compressed_blocks.append(compressed_block)
+                    block_specs.append({
+                        "active_mask": active_mask,
+                        "active_count": (
+                            int(active_mask.sum().item())
+                            if active_count is None else int(active_count)
+                        ),
+                    })
+
+                J_coo_unscaled = _cat_sparse_blocks(compressed_blocks)
+                if J_coo_unscaled.shape[1] == 0:
+                    _log(
+                        f"lm iter {n_it + 1:3d}: no active parameter DoFs; "
+                        "skipping LM step"
+                    )
+                    opt.last = opt.loss = (
+                        opt.loss if hasattr(opt, "loss")
+                        else opt.model.loss(inp, None)
+                    )
+                    continue
                 J_coo = J_coo_unscaled
                 scale = None
+                _log_jtj_diag_stats(
+                    f"lm iter {n_it + 1:3d} raw",
+                    compressed_blocks,
+                    pg["params"],
+                )
                 if not constant_rotation:
                     scale, raw_scale = _compute_column_scaling(J_coo)
                     J_coo = _apply_column_scaling(J_coo, scale)
@@ -927,10 +1407,32 @@ def solve(
                         f"p90={np.percentile(scale_np, 90):.3e} "
                         f"max={np.max(scale_np):.3e}"
                     )
+                    scaled_blocks = []
+                    offset = 0
+                    for block, spec in zip(compressed_blocks, block_specs):
+                        active_count = spec["active_count"]
+                        if active_count == 0:
+                            scaled_blocks.append(block)
+                        else:
+                            block_scale = scale[offset:offset + active_count]
+                            scaled_blocks.append(
+                                _apply_column_scaling(block, block_scale)
+                            )
+                        offset += active_count
+                    _log_jtj_diag_stats(
+                        f"lm iter {n_it + 1:3d} scaled",
+                        scaled_blocks,
+                        pg["params"],
+                    )
                 J = J_coo.to_sparse_csr()
                 J_T = J.mT.to_sparse_csr()
                 J_unscaled = J_coo_unscaled.to_sparse_csr()
 
+                # opt.model is pypose's RobustModel wrapper, whose .loss
+                # already applies the kernel — so this comparison is
+                # Huber-correct without further work here. The matching
+                # GN step direction is what `_apply_huber_correction`
+                # above fixes. See info.md §3.31.
                 last_loss = (
                     opt.loss if hasattr(opt, "loss")
                     else opt.model.loss(inp, None)
@@ -950,10 +1452,10 @@ def solve(
                     diagonal_op_(A, op=partial(torch.mul, other=1 + pg["damping"]))
                     rhs = -(J_T @ residual.view(-1, 1))
                     try:
-                        step = opt.solver(A, rhs)
-                        step = step[:, None]
+                        step_reduced = opt.solver(A, rhs)
+                        step_reduced = step_reduced[:, None]
                         if scale is not None:
-                            step = step * scale.reshape(-1, 1)
+                            step_reduced = step_reduced * scale.reshape(-1, 1)
                     except Exception as e:
                         _log(
                             f"lm iter {n_it + 1:3d} attempt {attempt}: "
@@ -961,51 +1463,108 @@ def solve(
                         )
                         break
 
+                    step_blocks_reduced = _split_step_vector(
+                        step_reduced,
+                        [spec["active_count"] for spec in block_specs],
+                    )
+                    step_blocks_full = _expand_step_blocks_to_full(
+                        step_blocks_reduced, block_specs)
+                    step_full = torch.cat(step_blocks_full).reshape(-1, 1)
+
                     _log_lm_iteration_stats(
                         f"lm iter {n_it + 1:3d} attempt {attempt}",
-                        j_blocks,
+                        compressed_blocks,
                         residual,
-                        step,
+                        step_reduced,
                         pg["params"],
+                        block_numels=[
+                            spec["active_count"] for spec in block_specs
+                        ],
                     )
 
-                    opt.update_parameter(pg["params"], step)
+                    opt.update_parameter(pg["params"], step_full)
                     new_loss = opt.model.loss(inp, None)
                     new_loss = new_loss.detach() if torch.is_tensor(new_loss) else new_loss
-                    d_blocks = _split_step_vector(
-                        step, _parameter_block_numels(pg["params"]))
-                    quality = _compute_quality(
-                        j_blocks, d_blocks, residual.view(-1, 1),
+                    quality_terms = _compute_quality_terms(
+                        compressed_blocks,
+                        step_blocks_reduced,
+                        residual.view(-1, 1),
                         float(opt.last), float(new_loss))
+                    quality = quality_terms["quality"]
+                    actual_reduction = quality_terms["actual_reduction"]
+                    predicted_reduction = quality_terms["predicted_reduction"]
+                    step_reduced_norm = float(step_reduced.norm().item())
+                    step_reduced_max = float(step_reduced.abs().max().item())
+                    accepted_zero_step = (
+                        step_reduced_norm < 1e-12 or step_reduced_max < 1e-12
+                    )
+                    tiny_step = (
+                        step_reduced_norm < tiny_step_norm_thresh
+                        or step_reduced_max < tiny_step_max_thresh
+                    )
                     opt.loss = new_loss
                     opt.strategy.update(
                         pg, last=opt.last, loss=opt.loss, J=J_unscaled,
-                        D=step, R=residual.view(-1, 1))
+                        D=step_reduced, R=residual.view(-1, 1))
                     rejected = bool(opt.last < opt.loss and opt.reject_count < opt.reject)
                     damping_after = float(pg["damping"])
+                    accepted_tiny_step = tiny_step and not rejected
+                    damping_saturation = damping_after >= damping_saturation_thresh
                     _log(
                         f"lm iter {n_it + 1:3d} attempt {attempt}: "
                         f"last={float(opt.last):.6f} "
                         f"new={float(new_loss):.6f} "
+                        f"actual_reduction={actual_reduction:.6e} "
+                        f"predicted_reduction={predicted_reduction:.6e} "
                         f"quality={quality:.3e} "
+                        f"step_norm={step_reduced_norm:.3e} "
+                        f"step_max={step_reduced_max:.3e} "
                         f"damping={damping_before:.3e}->{damping_after:.3e} "
                         f"reject_count={opt.reject_count} "
-                        f"accepted={not rejected}"
+                        f"accepted={not rejected} "
+                        f"accepted_zero_step={accepted_zero_step and not rejected} "
+                        f"accepted_tiny_step={accepted_tiny_step} "
+                        f"damping_saturation={damping_saturation}"
                     )
                     if rejected:
-                        opt.update_parameter(params=pg["params"], step=-step)
+                        accepted_tiny_streak = 0
+                        opt.update_parameter(params=pg["params"], step=-step_full)
                         opt.loss = opt.last
                         opt.reject_count += 1
                     else:
+                        if accepted_tiny_step and quality < low_quality_thresh:
+                            accepted_tiny_streak += 1
+                            _log(
+                                f"lm iter {n_it + 1:3d} attempt {attempt}: "
+                                "accepted tiny step with low quality; "
+                                f"streak={accepted_tiny_streak} "
+                                f"(tiny if step_norm<{tiny_step_norm_thresh:.0e} "
+                                f"or step_max<{tiny_step_max_thresh:.0e}, "
+                                f"low_quality<{low_quality_thresh:.0e})"
+                            )
+                            if accepted_tiny_streak >= 3:
+                                _log(
+                                    f"lm iter {n_it + 1:3d}: possible LM stagnation "
+                                    f"({accepted_tiny_streak} consecutive tiny "
+                                    "accepted steps)"
+                                )
+                        else:
+                            accepted_tiny_streak = 0
                         accepted = True
                         break
                 if not accepted and attempt > 0:
+                    accepted_tiny_streak = 0
                     _log(
                         f"lm iter {n_it + 1:3d}: no accepted step after "
                         f"{attempt} attempt(s)"
                     )
             return opt.loss
 
+        # Track which stop condition triggers the exit. Logged once at
+        # the end so we can correlate "BA call did N iters and stopped
+        # because X" with the per-stage residual percentile changes.
+        exit_reason = "max_iter"
+        windowed_imp_at_exit = float("nan")
         for _ in range(max_iters):
             loss = _debug_step()
             n_it += 1
@@ -1017,9 +1576,29 @@ def solve(
                     loss_hist[-2*window_size:-window_size]) / window_size
                 imp = (avg_p - avg_r) / avg_p
                 if abs(imp) < func_tol:
+                    exit_reason = "func_tol"
+                    windowed_imp_at_exit = imp
                     break
                 if loss_hist[-1] == loss_hist[-2]:
+                    exit_reason = "loss_repeat"
+                    windowed_imp_at_exit = imp
                     break
+        # Diagnostic: report what stopped the LM so we can tell whether
+        # raising max_num_iterations would help (max_iter exit) or not
+        # (func_tol / loss_repeat exit).
+        if len(loss_hist) >= 2:
+            cost_drop_total = (
+                (loss_hist[0] - loss_hist[-1]) / max(loss_hist[0], 1e-30)
+            )
+        else:
+            cost_drop_total = 0.0
+        _log(
+            f"_run_ba exit: reason={exit_reason} n_it={n_it}/{max_iters} "
+            f"cost_first={loss_hist[0] if loss_hist else float('nan'):.6f} "
+            f"cost_last={loss_hist[-1] if loss_hist else float('nan'):.6f} "
+            f"cost_drop_total={cost_drop_total:.4e} "
+            f"windowed_imp={windowed_imp_at_exit:.4e}"
+        )
         return n_it, loss_hist
 
     # ------------------------------------------------------------------
@@ -1034,7 +1613,7 @@ def solve(
     # already handles iterative filter→re-optimise (3 iterations with
     # decreasing thresholds), so we don't duplicate that here.
     # ------------------------------------------------------------------
-    model, optimizer, input_data, remap = _build_problem(
+    model, optimizer, input_data, remap, constraint_masks = _build_problem(
         image_indices_cur, camera_indices_cur,
         point_indices_cur, points_2d_cur,
     )
@@ -1066,12 +1645,15 @@ def solve(
         refine_focal_length,
         refine_extra_params,
     )
-    initial_cost = model.loss(input_data, None).item()
+    # Use optimizer.model.loss (RobustModel) so initial_cost is in the same
+    # kernel-weighted units as loss_hist[0] produced by _debug_step.
+    initial_cost = optimizer.model.loss(input_data, None).item()
     _log(
         f"initial cost={initial_cost:.6f}, obs={len(image_indices_cur)}"
     )
 
-    n_it, loss_hist = _run_ba(model, optimizer, input_data, max_iterations)
+    n_it, loss_hist = _run_ba(
+        model, optimizer, input_data, max_iterations, constraint_masks)
 
     # Write optimised params back.
     ig_n2o, cm_n2o, pt_n2o = remap

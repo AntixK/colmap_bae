@@ -251,6 +251,24 @@ def main():
             str(model_dir),
         ]
     )
+
+    # Export the sparse point cloud as PLY (alongside the .bin model).
+    ply_path = model_dir / "points3D.ply"
+    print(f"\n-- Exporting PLY to {ply_path} --")
+    run(
+        [
+            "colmap",
+            "model_converter",
+            "--input_path",
+            str(model_dir),
+            "--output_path",
+            str(ply_path),
+            "--output_type",
+            "PLY",
+        ]
+    )
+    check(ply_path.exists(), f"PLY exported to {ply_path}")
+
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------

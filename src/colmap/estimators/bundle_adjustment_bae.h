@@ -9,14 +9,13 @@ namespace colmap {
 // BAE-specific bundle adjustment options.
 struct BaeBundleAdjustmentOptions {
   // Maximum number of LM iterations.
-  // Bumped 150 -> 300 because the post-§3.31 (kernel-correction) bridge
-  // run showed iter1.full exiting at 150/150 max_iter with cost still
-  // descending (cost_drop_total=3.7%, windowed_imp=nan — budget-bound
-  // not tolerance-bound). 300 gives Ceres-comparable iteration headroom
-  // on the hard call without affecting easier datasets (most calls
-  // exit on func_tol after ~8-20 iters anyway). The retri/refinement
-  // path still overrides this to 50 in global_mapper.cc.
-  int max_num_iterations = 300;
+  // 200 is a middle ground: 150 (the original cap, which bridge iter1.full
+  // was iter-cap-binding after the §3.31 kernel fix) and 300 (which the
+  // 6-dataset cross-benchmark showed was over-budgeting most calls and
+  // costing ~3× wall time on bridge with only marginal quality gain).
+  // The retri/refinement path still overrides this to 50 in
+  // global_mapper.cc.
+  int max_num_iterations = 200;
 
   // Whether to use GPU for BAE optimization.
   bool use_gpu = true;

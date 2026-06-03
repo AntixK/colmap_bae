@@ -668,6 +668,22 @@ def _split_step_vector(step, numels):
     return splits
 
 
+def _split_flat_vector(vec, numels):
+    splits = []
+    offset = 0
+    flat = vec.reshape(-1)
+    for n in numels:
+        splits.append(flat[offset:offset + n])
+        offset += n
+    return splits
+
+
+def _block_labels(params):
+    if len(params) == 3:
+        return ["pose", "intr", "points"]
+    return [f"block{i}" for i in range(len(params))]
+
+
 def _build_compact_constraint_masks(
     ig_n2o,
     cm_n2o,
@@ -862,28 +878,28 @@ def _log_lm_iteration_stats(
         rhs = -(block.to_sparse_csr().mT @ residual_col).reshape(-1)
         rhs_blocks.append(rhs)
 
-    labels = []
-    if len(params) == 3:
-        labels = ["pose", "intr", "points"]
-    else:
-        labels = [f"block{i}" for i in range(len(params))]
+    labels = _block_labels(params)
 
     summaries = []
-    for label, rhs, step in zip(labels, rhs_blocks, step_blocks):
+    for label, rhs, step, block in zip(labels, rhs_blocks, step_blocks, J_blocks):
+        active_dofs = int(step.numel())
         rhs_norm = rhs.norm().item() if rhs.numel() > 0 else 0.0
         step_norm = step.norm().item() if step.numel() > 0 else 0.0
         step_max = step.abs().max().item() if step.numel() > 0 else 0.0
+        step_rms = step_norm / np.sqrt(active_dofs) if active_dofs > 0 else 0.0
+        jd = block.to_sparse_coo() @ step.reshape(-1, 1)
+        jd_norm = jd.norm().item() if jd.numel() > 0 else 0.0
+        jd_max = jd.abs().max().item() if jd.numel() > 0 else 0.0
         summaries.append(
-            f"{label}:|JTr|={rhs_norm:.3e}|D|={step_norm:.3e}|D|max={step_max:.3e}"
+            f"{label}:n={active_dofs}|JTr|={rhs_norm:.3e}"
+            f"|D|={step_norm:.3e}|D|rms={step_rms:.3e}|D|max={step_max:.3e}"
+            f"|JD|={jd_norm:.3e}|JD|max={jd_max:.3e}"
         )
     _log(f"{tag} " + "  ".join(summaries))
 
 
 def _log_jtj_diag_stats(tag, J_blocks, params):
-    if len(params) == 3:
-        labels = ["pose", "intr", "points"]
-    else:
-        labels = [f"block{i}" for i in range(len(params))]
+    labels = _block_labels(params)
 
     summaries = []
     for label, block in zip(labels, J_blocks):
@@ -898,17 +914,71 @@ def _log_jtj_diag_stats(tag, J_blocks, params):
         )
         diag.scatter_add_(0, cols, vals * vals)
         diag_np = diag.detach().cpu().numpy()
+        p10 = np.percentile(diag_np, 10)
+        p50 = np.percentile(diag_np, 50)
+        p90 = np.percentile(diag_np, 90)
+        diag_max = np.max(diag_np)
+        spread = diag_max / max(p10, 1e-30)
         summaries.append(
             f"{label}:diag(JTJ)"
-            f"[p10={np.percentile(diag_np, 10):.3e}"
-            f" p50={np.percentile(diag_np, 50):.3e}"
-            f" p90={np.percentile(diag_np, 90):.3e}"
-            f" max={np.max(diag_np):.3e}]"
+            f"[p10={p10:.3e}"
+            f" p50={p50:.3e}"
+            f" p90={p90:.3e}"
+            f" max={diag_max:.3e}"
+            f" spread={spread:.3e}]"
         )
     _log(f"{tag} " + "  ".join(summaries))
 
 
-def _compute_quality_terms(J_blocks, D_blocks, residual, last_loss, new_loss):
+def _log_column_scale_stats(tag, raw_scale_blocks, scale_blocks, params):
+    labels = _block_labels(params)
+    summaries = []
+    for label, raw_block, scale_block in zip(labels, raw_scale_blocks, scale_blocks):
+        if raw_block.numel() == 0:
+            summaries.append(f"{label}:scale=empty")
+            continue
+        raw_np = raw_block.detach().cpu().numpy()
+        scale_np = scale_block.detach().cpu().numpy()
+        raw_p10 = np.percentile(raw_np, 10)
+        raw_p50 = np.percentile(raw_np, 50)
+        raw_p90 = np.percentile(raw_np, 90)
+        raw_max = np.max(raw_np)
+        scale_p10 = np.percentile(scale_np, 10)
+        scale_p50 = np.percentile(scale_np, 50)
+        scale_p90 = np.percentile(scale_np, 90)
+        scale_max = np.max(scale_np)
+        raw_spread = raw_max / max(raw_p10, 1e-30)
+        scale_spread = scale_max / max(scale_p10, 1e-30)
+        summaries.append(
+            f"{label}:raw[p10={raw_p10:.3e} p50={raw_p50:.3e} "
+            f"p90={raw_p90:.3e} max={raw_max:.3e} spread={raw_spread:.3e}]"
+            f" scale[p10={scale_p10:.3e} p50={scale_p50:.3e} "
+            f"p90={scale_p90:.3e} max={scale_max:.3e} "
+            f"spread={scale_spread:.3e}]"
+        )
+    _log(f"{tag} " + "  ".join(summaries))
+
+
+def _compute_quality_terms_from_matrix(J, D, residual, last_loss, new_loss):
+    jd = J @ D
+    residual_col = residual.reshape(-1, 1)
+    denom = -(jd.mT @ (2 * residual_col + jd)).reshape(())
+    denom_val = float(denom.item()) if torch.is_tensor(denom) else float(denom)
+    actual_reduction = float(last_loss - new_loss)
+    if abs(denom_val) < 1e-20:
+        quality = float("nan")
+    else:
+        quality = float(actual_reduction / denom_val)
+    return {
+        "actual_reduction": actual_reduction,
+        "predicted_reduction": denom_val,
+        "quality": quality,
+    }
+
+
+def _compute_quality_terms_from_blocks(
+    J_blocks, D_blocks, residual, last_loss, new_loss
+):
     jd = None
     for block, d_block in zip(J_blocks, D_blocks):
         contrib = block.to_sparse_coo() @ d_block.reshape(-1, 1)
@@ -976,7 +1046,59 @@ def _huber_rho_and_weight(s, delta):
     return rho_per_obs, weight
 
 
-def _apply_huber_correction(residual_2d, j_blocks, delta):
+def _summarize_huber_state(residual_2d, delta):
+    s = (residual_2d * residual_2d).sum(dim=-1)
+    rho_per_obs, weight = _huber_rho_and_weight(s, delta)
+    residual_weighted = residual_2d * weight.unsqueeze(-1)
+    robust_cost = 0.5 * rho_per_obs.sum()
+    weighted_ls_cost = 0.5 * (residual_weighted * residual_weighted).sum()
+
+    weight_np = weight.detach().cpu().numpy()
+    inlier_frac = (
+        float((s <= delta * delta).to(torch.float64).mean().item())
+        if s.numel() > 0
+        else float("nan")
+    )
+    return {
+        "weight": weight,
+        "robust_cost": float(robust_cost.item()),
+        "weighted_ls_cost": float(weighted_ls_cost.item()),
+        "inlier_frac": inlier_frac,
+        "weight_min": float(np.min(weight_np)) if weight_np.size > 0 else float("nan"),
+        "weight_p10": float(np.percentile(weight_np, 10))
+        if weight_np.size > 0
+        else float("nan"),
+        "weight_p50": float(np.percentile(weight_np, 50))
+        if weight_np.size > 0
+        else float("nan"),
+        "weight_p90": float(np.percentile(weight_np, 90))
+        if weight_np.size > 0
+        else float("nan"),
+        "weight_max": float(np.max(weight_np)) if weight_np.size > 0 else float("nan"),
+    }
+
+
+def _log_huber_state(tag, huber_state, model_loss=None):
+    extra = ""
+    if model_loss is not None:
+        extra = (
+            f" robust_model_gap="
+            f"{abs(float(model_loss) - huber_state['robust_cost']):.3e}"
+        )
+    _log(
+        f"{tag} huber: inliers={100.0 * huber_state['inlier_frac']:.1f}% "
+        f"w[min={huber_state['weight_min']:.3e} "
+        f"p10={huber_state['weight_p10']:.3e} "
+        f"p50={huber_state['weight_p50']:.3e} "
+        f"p90={huber_state['weight_p90']:.3e} "
+        f"max={huber_state['weight_max']:.3e}] "
+        f"robust_cost={huber_state['robust_cost']:.6e} "
+        f"weighted_ls={huber_state['weighted_ls_cost']:.6e}"
+        f"{extra}"
+    )
+
+
+def _apply_huber_correction(residual_2d, j_blocks, delta, weight=None):
     """Triggs FastTriggs (square-rooted kernel) correction for (R, J).
 
     The bae library's `LM.step()` silently drops the configured robust
@@ -997,14 +1119,15 @@ def _apply_huber_correction(residual_2d, j_blocks, delta):
         residual_weighted: (N, 2) — kernel-weighted residual.
         j_blocks_weighted: list of sparse COO — kernel-weighted Jacobians.
     """
-    s = (residual_2d * residual_2d).sum(dim=-1)  # (N,)
-    _, w = _huber_rho_and_weight(s, delta)
+    if weight is None:
+        s = (residual_2d * residual_2d).sum(dim=-1)  # (N,)
+        _, weight = _huber_rho_and_weight(s, delta)
 
-    residual_weighted = residual_2d * w.unsqueeze(-1)  # (N, 2)
+    residual_weighted = residual_2d * weight.unsqueeze(-1)  # (N, 2)
 
     # Each 2D residual r_i corresponds to two rows of J (rows 2i, 2i+1).
     # Both rows get the same weight w_i.
-    w_per_row = w.unsqueeze(-1).expand(-1, 2).reshape(-1)  # (2N,)
+    w_per_row = weight.unsqueeze(-1).expand(-1, 2).reshape(-1)  # (2N,)
     j_blocks_weighted = []
     for j in j_blocks:
         j = j.coalesce()
@@ -1318,13 +1441,13 @@ def solve(
     # ------------------------------------------------------------------
     def _run_ba(mdl, opt, inp, max_iters, constraint_masks):
         window_size = 4
-        # Tightened 5e-4 -> 5e-5: on kushimoto every BA call exited at 8-18
-        # iters via the previous threshold with cost still descending at
-        # ~3-5e-4 per window, while Ceres on the same input kept descending
-        # for ~3 more orders of magnitude in cost. Bridge was iter-cap-bound
-        # so this change is a no-op there; kushimoto/mihama benefit. See
-        # info.md §3.31 / kushimoto run analysis.
-        func_tol = 5e-5
+        # Reverted 5e-5 -> 5e-4: the 5e-5 tighten was motivated by kushimoto
+        # exiting at windowed_imp~3-5e-4 with cost still descending, but the
+        # 6-dataset cross-benchmark (info.md §3.35) confirmed it did not move
+        # kushimoto's outcome (cost plateaus at a worse local minimum than
+        # Ceres regardless of the threshold) while letting other datasets
+        # over-iterate at the asymptote. 5e-4 restores the original budget.
+        func_tol = 5e-4
         loss_hist = []
         n_it = 0
         accepted_tiny_streak = 0
@@ -1337,11 +1460,11 @@ def solve(
         def _debug_step():
             nonlocal accepted_tiny_streak
             for pg in opt.param_groups:
-                residual = list(opt.model(inp))[0]
-                j_blocks = jacobian(residual, pg["params"])
-                if isinstance(residual, TrackingTensor):
-                    residual = residual.tensor()
-                residual = residual.detach()
+                raw_residual = list(opt.model(inp))[0]
+                j_blocks = jacobian(raw_residual, pg["params"])
+                if isinstance(raw_residual, TrackingTensor):
+                    raw_residual = raw_residual.tensor()
+                raw_residual = raw_residual.detach()
                 j_blocks = [j.detach().to_sparse_coo() for j in j_blocks]
                 # Apply Triggs FastTriggs (square-rooted Huber) correction to
                 # (R, J). The bae library's `LM.step()` drops the kernel
@@ -1350,8 +1473,12 @@ def solve(
                 # heavy datasets stall (info.md §3.31). The `model.loss`
                 # used for accept/reject is already kerneled via pypose's
                 # `RobustModel` wrapper, so we only need to weight R and J.
+                huber_state = _summarize_huber_state(raw_residual, kernel_delta)
                 residual, j_blocks = _apply_huber_correction(
-                    residual, j_blocks, kernel_delta
+                    raw_residual,
+                    j_blocks,
+                    kernel_delta,
+                    weight=huber_state["weight"],
                 )
                 raw_block_masks = [
                     constraint_masks["pose_active"],
@@ -1407,6 +1534,15 @@ def solve(
                         f"p90={np.percentile(scale_np, 90):.3e} "
                         f"max={np.max(scale_np):.3e}"
                     )
+                    active_counts = [
+                        spec["active_count"] for spec in block_specs
+                    ]
+                    _log_column_scale_stats(
+                        f"lm iter {n_it + 1:3d} scaling_by_block",
+                        _split_flat_vector(raw_scale, active_counts),
+                        _split_flat_vector(scale, active_counts),
+                        pg["params"],
+                    )
                     scaled_blocks = []
                     offset = 0
                     for block, spec in zip(compressed_blocks, block_specs):
@@ -1440,19 +1576,31 @@ def solve(
                 last_loss = last_loss.detach() if torch.is_tensor(last_loss) else last_loss
                 opt.last = opt.loss = last_loss
                 opt.reject_count = 0
+                _log_huber_state(
+                    f"lm iter {n_it + 1:3d}",
+                    huber_state,
+                    model_loss=last_loss,
+                )
 
-                A = opt.mm(J_T, J)
-                diagonal_op_(A, op=partial(torch.clamp_, min=pg["min"], max=pg["max"]))
+                A_base = opt.mm(J_T, J)
+                diagonal_op_(
+                    A_base,
+                    op=partial(torch.clamp_, min=pg["min"], max=pg["max"]),
+                )
 
                 attempt = 0
                 accepted = False
                 while opt.last <= opt.loss:
                     attempt += 1
                     damping_before = float(pg["damping"])
-                    diagonal_op_(A, op=partial(torch.mul, other=1 + pg["damping"]))
+                    A_attempt = A_base.clone()
+                    diagonal_op_(
+                        A_attempt,
+                        op=partial(torch.mul, other=1 + pg["damping"]),
+                    )
                     rhs = -(J_T @ residual.view(-1, 1))
                     try:
-                        step_reduced = opt.solver(A, rhs)
+                        step_reduced = opt.solver(A_attempt, rhs)
                         step_reduced = step_reduced[:, None]
                         if scale is not None:
                             step_reduced = step_reduced * scale.reshape(-1, 1)
@@ -1485,14 +1633,51 @@ def solve(
                     opt.update_parameter(pg["params"], step_full)
                     new_loss = opt.model.loss(inp, None)
                     new_loss = new_loss.detach() if torch.is_tensor(new_loss) else new_loss
-                    quality_terms = _compute_quality_terms(
+                    new_raw_residual = list(opt.model(inp))[0]
+                    if isinstance(new_raw_residual, TrackingTensor):
+                        new_raw_residual = new_raw_residual.tensor()
+                    new_raw_residual = new_raw_residual.detach()
+                    new_huber_state = _summarize_huber_state(
+                        new_raw_residual, kernel_delta
+                    )
+                    _log_huber_state(
+                        f"lm iter {n_it + 1:3d} attempt {attempt} post_step",
+                        new_huber_state,
+                        model_loss=new_loss,
+                    )
+                    quality_terms_blocks = _compute_quality_terms_from_blocks(
                         compressed_blocks,
                         step_blocks_reduced,
                         residual.view(-1, 1),
-                        float(opt.last), float(new_loss))
-                    quality = quality_terms["quality"]
-                    actual_reduction = quality_terms["actual_reduction"]
-                    predicted_reduction = quality_terms["predicted_reduction"]
+                        float(opt.last),
+                        float(new_loss),
+                    )
+                    quality_terms_strategy = _compute_quality_terms_from_matrix(
+                        J_unscaled,
+                        step_reduced,
+                        residual.view(-1, 1),
+                        float(opt.last),
+                        float(new_loss),
+                    )
+                    quality = quality_terms_strategy["quality"]
+                    actual_reduction = quality_terms_strategy["actual_reduction"]
+                    predicted_reduction = quality_terms_strategy["predicted_reduction"]
+                    predicted_gap = abs(
+                        quality_terms_blocks["predicted_reduction"]
+                        - quality_terms_strategy["predicted_reduction"]
+                    )
+                    block_quality = quality_terms_blocks["quality"]
+                    if np.isnan(block_quality) and np.isnan(quality):
+                        quality_gap = 0.0
+                    else:
+                        quality_gap = abs(block_quality - quality)
+                    robust_drop = (
+                        huber_state["robust_cost"] - new_huber_state["robust_cost"]
+                    )
+                    weighted_ls_drop = (
+                        huber_state["weighted_ls_cost"]
+                        - new_huber_state["weighted_ls_cost"]
+                    )
                     step_reduced_norm = float(step_reduced.norm().item())
                     step_reduced_max = float(step_reduced.abs().max().item())
                     accepted_zero_step = (
@@ -1510,13 +1695,24 @@ def solve(
                     damping_after = float(pg["damping"])
                     accepted_tiny_step = tiny_step and not rejected
                     damping_saturation = damping_after >= damping_saturation_thresh
+                    if predicted_gap > 1e-8 or quality_gap > 1e-8:
+                        _log(
+                            f"lm iter {n_it + 1:3d} attempt {attempt}: "
+                            f"trust-region mismatch predicted_gap={predicted_gap:.3e} "
+                            f"quality_gap={quality_gap:.3e}"
+                        )
                     _log(
                         f"lm iter {n_it + 1:3d} attempt {attempt}: "
                         f"last={float(opt.last):.6f} "
                         f"new={float(new_loss):.6f} "
                         f"actual_reduction={actual_reduction:.6e} "
+                        f"robust_drop={robust_drop:.6e} "
+                        f"weighted_ls_drop={weighted_ls_drop:.6e} "
                         f"predicted_reduction={predicted_reduction:.6e} "
                         f"quality={quality:.3e} "
+                        f"quality_block={block_quality:.3e} "
+                        f"predicted_gap={predicted_gap:.3e} "
+                        f"quality_gap={quality_gap:.3e} "
                         f"step_norm={step_reduced_norm:.3e} "
                         f"step_max={step_reduced_max:.3e} "
                         f"damping={damping_before:.3e}->{damping_after:.3e} "

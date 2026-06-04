@@ -36,6 +36,7 @@ Read [.claude/rules/](rules/) before any action. Each rule has examples of what 
 - **[07-instantsfm-not-oracle.md](rules/07-instantsfm-not-oracle.md)** — InstantSfM is one data point, not ground truth.
 - **[08-no-overpromising.md](rules/08-no-overpromising.md)** — every proposal needs cost, falsifier, and a diagnostic-first alternative.
 - **[09-handle-pushback.md](rules/09-handle-pushback.md)** — after pushback, respond with code, measurement, or "I don't know yet" — never a rephrased claim.
+- **[10-coding-style.md](rules/10-coding-style.md)** — C++ (clang-format Google) and Python (ruff) conventions enforced by the formatters plus project-specific habits.
 
 ## Skills (how-to references)
 
